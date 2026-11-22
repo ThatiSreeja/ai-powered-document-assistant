@@ -26,7 +26,7 @@ def _json_completion(system, messages, max_tokens):
 
 
 def available_documents(user_id, conversation_id):
-    query = Document.query.filter_by(user_id=user_id)
+    query = Document.query.filter_by(user_id=user_id).filter(Document.status != "deleting")
     if conversation_id is not None:
         query = query.join(conversation_documents).join(Conversation).filter(
             Conversation.id == conversation_id, Conversation.user_id == user_id)
@@ -57,12 +57,18 @@ def answer(user_id, question, history, *, conversation_id=None):
 
     requested = route.get("document_ids")
     requested = {value for value in requested if type(value) is int} if isinstance(requested, list) else set()
+    if conversation_id is not None:
+        requested &= {doc.id for doc in documents}
     named = {doc.id for doc in documents if doc.original_name.casefold() in question.casefold()}
     if named:
         requested = named
         if mode == "general":
             mode = "document"
-    ready = [doc.id for doc in documents if doc.status == "ready" and (not requested or doc.id in requested)]
+    selected = [doc for doc in documents if not requested or doc.id in requested]
+    ready = [doc.id for doc in selected if doc.status == "ready"]
+    waiting = [doc for doc in selected if doc.status in {"uploaded", "processing", "extracting", "embedding", "indexing"}]
+    if mode != "general" and waiting and (requested or not ready):
+        return "The PDF is still processing. Wait until it shows Ready, then ask again.", []
     query = route.get("query")
     query = query.strip()[:4000] if isinstance(query, str) and query.strip() else question
     inferred = mode == "general"
@@ -74,6 +80,8 @@ def answer(user_id, question, history, *, conversation_id=None):
     hits = overview(user_id, ready) if broad else retrieve(
         user_id, query, document_ids=ready, max_distance=distance, across_documents=across)
     if not hits:
+        if mode != "general" and waiting:
+            return "Some attached PDFs are still processing. Try again when they show Ready.", []
         if inferred:
             return groq_chat.complete(GENERAL, messages), []
         if mode == "mixed":

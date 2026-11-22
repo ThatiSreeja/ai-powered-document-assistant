@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { FileText, MessageSquare, Paperclip, Plus, RefreshCw, Send, Sparkles, Trash2, X } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import api from './services/api'
+import { documentStatus, isProcessing, prepareUploads, useDocumentPolling } from './services/documentJobs'
 
 const conversationsUrl = '/chat/conversations'
 const attachmentUrl = id => `${conversationsUrl}/${id}/attachments`
@@ -18,12 +19,21 @@ export default function Chat({ PageTitle, Empty }) {
   const [library, setLibrary] = useState(null)
   const [question, setQuestion] = useState('')
   const [operation, setOperation] = useState('loading')
+  const [uploading, setUploading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(null)
+  const [deleting, setDeleting] = useState(0)
   const [dragging, setDragging] = useState(false)
   const [error, setError] = useState('')
   const filePicker = useRef(null)
   const dragDepth = useRef(0)
   const messageEnd = useRef(null)
+  const hiddenDocuments = useRef(new Set())
   const locked = Boolean(operation)
+  const navigating = locked || uploading || deleting > 0
+  const refreshAttachments = useCallback(rows =>
+    setAttachments(rows.filter(row => !hiddenDocuments.current.has(row.id))), [])
+  useDocumentPolling(active ? attachmentUrl(active) : null,
+    !uploading && attachments.some(isProcessing), refreshAttachments)
 
   useEffect(() => {
     async function load() {
@@ -92,24 +102,26 @@ export default function Chat({ PageTitle, Empty }) {
   }
 
   function upload(files) {
-    const selected = Array.from(files || [])
-    if (!selected.length || locked) return
-    const entries = selected.map((file, index) => ({
-      index, name: file.name, size: file.size, status: /\.pdf$/i.test(file.name) ? 'uploading' : 'failed',
-      error: /\.pdf$/i.test(file.name) ? null : 'Only PDF files can be attached.',
-    }))
-    const valid = selected.filter((_, index) => !entries[index].error)
-    return perform('uploading', async () => {
+    if (!files?.length || locked || uploading) return
+    const entries = prepareUploads(files, true)
+    const valid = entries.filter(entry => !entry.error)
+    setPending(entries)
+    if (!valid.length) return
+    setUploading(true)
+    setUploadProgress(null)
+    setError('')
+    return (async () => {
       try {
-        const id = valid.length ? active || await create() : active
+        const id = active || await create()
         setPending(entries)
         if (!valid.length) return
         const form = new FormData()
-        valid.forEach(file => form.append('files', file))
+        valid.forEach(entry => form.append('files', entry.file))
         const { data } = await api.post(attachmentUrl(id), form, {
           onUploadProgress: event => {
+            if (event.total) setUploadProgress(Math.floor(100 * event.loaded / event.total))
             if (event.total && event.loaded >= event.total) {
-              setPending(rows => rows.map(row => row.error ? row : { ...row, status: 'processing' }))
+              setPending(rows => rows.map(row => row.error ? row : { ...row, status: 'uploaded' }))
             }
           },
         })
@@ -128,15 +140,16 @@ export default function Chat({ PageTitle, Empty }) {
       } catch (err) {
         const reason = messageFor(err, 'Upload failed. Select the files to retry.')
         setPending(entries.map(entry => ({ ...entry, status: 'failed', error: entry.error || reason })))
-        throw err
+      } finally {
+        setUploading(false)
       }
-    }, 'Upload failed. Select the files to retry.')
+    })()
   }
 
   function send(event) {
     event.preventDefault()
     const content = question.trim()
-    if (!content) return
+    if (!content || (uploading && !active)) return
     return perform('sending', async () => {
       const id = active || await create()
       setQuestion('')
@@ -189,27 +202,35 @@ export default function Chat({ PageTitle, Empty }) {
     }, 'Could not delete conversation.')
   }
 
-  function deletePdf(document) {
+  async function deletePdf(document) {
     if (!window.confirm(`Permanently delete “${document.name}” from your library and every conversation?`)) return
-    perform('saving', async () => {
+    hiddenDocuments.current.add(document.id)
+    setAttachments(rows => rows.filter(row => row.id !== document.id))
+    setDeleting(count => count + 1)
+    try {
       await api.delete(`/documents/${document.id}`)
-      setAttachments(rows => rows.filter(row => row.id !== document.id))
       setLibrary(rows => rows?.filter(row => row.id !== document.id) ?? null)
-    }, 'Could not delete this PDF.')
+    } catch (err) {
+      hiddenDocuments.current.delete(document.id)
+      updateAttachment(document)
+      setError(messageFor(err, 'Could not delete this PDF.'))
+    } finally {
+      setDeleting(count => count - 1)
+    }
   }
 
   return <>
     <PageTitle eyebrow="YOUR ASSISTANT" title="AI chat" subtitle="Ask a general question or attach PDFs to chat with them." />
     <div className="chat-layout">
       <aside className="chat-list">
-        <button className="button primary full" disabled={locked} onClick={() => perform('saving', create, 'Could not create a conversation.')}>
+        <button className="button primary full" disabled={navigating} onClick={() => perform('saving', create, 'Could not create a conversation.')}>
           <Plus size={15} /> New conversation
         </button>
         <div className="nav-label">RECENT</div>
         {conversations.map(conversation => <div key={conversation.id} className={`conversation-row ${active === conversation.id ? 'selected' : ''}`}>
-          <button className="conversation-item" disabled={locked} onClick={() => open(conversation.id)}><MessageSquare size={15} /><span>{conversation.title}</span></button>
+          <button className="conversation-item" disabled={navigating} onClick={() => open(conversation.id)}><MessageSquare size={15} /><span>{conversation.title}</span></button>
           <button className="conversation-action" disabled={locked} title="Rename conversation" onClick={() => rename(conversation)}>···</button>
-          <button className="conversation-action delete-action" disabled={locked} title="Delete conversation" onClick={() => removeConversation(conversation)}><Trash2 size={14} /></button>
+          <button className="conversation-action delete-action" disabled={navigating} title="Delete conversation" onClick={() => removeConversation(conversation)}><Trash2 size={14} /></button>
         </div>)}
       </aside>
       <div className="chat-panel">
@@ -239,7 +260,12 @@ export default function Chat({ PageTitle, Empty }) {
           onDragLeave={() => { dragDepth.current = Math.max(0, dragDepth.current - 1); if (!dragDepth.current) setDragging(false) }}
           onDrop={event => { event.preventDefault(); dragDepth.current = 0; setDragging(false); upload(event.dataTransfer.files) }}>
           {error && <div role="alert" className="alert">{error}</div>}
-          {operation === 'uploading' && <p className="attachment-progress" role="status"><RefreshCw size={14} /> Uploading and processing PDFs…</p>}
+          {uploading && <p className="attachment-progress" role="status">
+            <RefreshCw size={14} /> {uploadProgress === 100 ? 'Saving PDFs…' : 'Uploading PDFs…'}
+            {uploadProgress !== null && <progress max="100" value={uploadProgress} aria-label="PDF transfer progress" />}
+          </p>}
+          {deleting > 0 && <p role="status">Removing PDF…</p>}
+          {attachments.some(isProcessing) && <p role="status">You can ask general questions while PDFs are processing.</p>}
           {dragging && <p className="attachment-progress">Drop PDFs here to attach them</p>}
           {(attachments.length > 0 || pending.length > 0) && <ul className="chat-attachments" aria-label="Attached PDFs">
             {[...attachments, ...pending].map(doc => <li className="chat-attachment" key={doc.id || `pending-${doc.index}`}>
@@ -247,7 +273,7 @@ export default function Chat({ PageTitle, Empty }) {
               <div className="attachment-info">
                 {doc.id && doc.status === 'ready' ? <button className="attachment-name" type="button" title={doc.name} onClick={() => viewPdf(doc.id)}>{doc.name}</button>
                   : <span className="attachment-name" title={doc.name}>{doc.name}</span>}
-                <small>{sizeLabel(doc.size)} · {doc.status}</small>
+                <small>{sizeLabel(doc.size)} · {documentStatus(doc.status)}</small>
                 {doc.error && <small className="error-text">{doc.error}</small>}
               </div>
               {doc.id && doc.status === 'failed' && <button type="button" className="icon-button" aria-label={`Retry ${doc.name}`} disabled={locked} onClick={() => perform('uploading', async () => {
@@ -274,9 +300,9 @@ export default function Chat({ PageTitle, Empty }) {
           </div>}
           <div className="chat-input-row">
             <input hidden type="file" multiple accept=".pdf,application/pdf" ref={filePicker} aria-label="Choose PDF attachments" onChange={event => { upload(event.target.files); event.target.value = '' }} />
-            <button type="button" className="icon-button chat-attach-button" aria-label="Attach PDFs" title="Attach PDFs" disabled={locked} onClick={() => filePicker.current?.click()}><Paperclip size={20} /></button>
+            <button type="button" className="icon-button chat-attach-button" aria-label="Attach PDFs" title="Attach PDFs" disabled={locked || uploading} onClick={() => filePicker.current?.click()}><Paperclip size={20} /></button>
             <textarea value={question} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) send(event) }} aria-label="Your question" placeholder="Ask a question…" maxLength={4000} rows="1" />
-            <button className="send-button" disabled={!question.trim() || locked} aria-label="Send" title="Send"><Send size={16} /></button>
+            <button className="send-button" disabled={!question.trim() || locked || (uploading && !active)} aria-label="Send" title="Send"><Send size={16} /></button>
           </div>
           <button type="button" className="chat-library-toggle" disabled={locked} onClick={() => library ? setLibrary(null) : perform('loading-library', async () => { const { data } = await api.get('/documents?type=pdf'); setLibrary(data) }, 'Could not load your PDFs.')}>
             {library ? 'Close library picker' : 'Attach from library'}

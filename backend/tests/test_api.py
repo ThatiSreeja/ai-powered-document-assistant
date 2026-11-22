@@ -13,8 +13,8 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 
 from app import create_app
 from app.extensions import db
-from app.models import Message, User
-from app.services import vectors
+from app.models import Document, DocumentChunk, DocumentFile, Message, User
+from app.services import document_jobs, groq_chat, vectors
 from config import database_url
 
 
@@ -162,7 +162,7 @@ def test_accounts_and_workspace_survive_app_restart(persistent_database, tmp_pat
     with app.app_context():
         db.engine.dispose()
 
-    restarted = create_app(config)
+    restarted = create_app({**config, "DOCUMENT_JOBS": True})
     with restarted.app_context():
         upgrade(directory=migration_dir)
     reopened = restarted.test_client()
@@ -176,6 +176,11 @@ def test_accounts_and_workspace_survive_app_restart(persistent_database, tmp_pat
     assert reopened.get("/api/documents", headers=new_auth).json[0]["id"] == document_id
     pdf_url = f"/api/documents/{document_id}/pdf"
     assert reopened.get(pdf_url, headers=new_auth).data.startswith(b"%PDF-")
+    reused = reopened.post(path + "/attachments", headers=new_auth, data={
+        "files": (io.BytesIO(reopened.get(pdf_url, headers=new_auth).data), "launch.pdf"),
+    })
+    assert reused.json[0]["id"] == document_id
+    assert reused.json[0]["status"] == "ready"
     assert (tmp_path / "vectors" / "chroma.sqlite3").is_file()
     with restarted.app_context():
         assert vectors._collection().get(where={"document_id": document_id})["ids"]
@@ -187,6 +192,73 @@ def test_accounts_and_workspace_survive_app_restart(persistent_database, tmp_pat
     other_auth = {"Authorization": "Bearer " + other.json["access_token"]}
     assert reopened.get(path, headers=other_auth).status_code == 404
     assert reopened.get(pdf_url, headers=other_auth).status_code == 404
+
+
+def test_document_jobs_survive_restart_and_delete_safely(persistent_database, tmp_path, monkeypatch):
+    config = {
+        **persistent_database, "TESTING": True, "DOCUMENT_JOBS": True, "RATELIMIT_ENABLED": False,
+        "JWT_SECRET_KEY": "persistent-document-jobs-testing-secret",
+        "UPLOAD_FOLDER": str(tmp_path / "uploads"), "CHROMA_PATH": str(tmp_path / "vectors"),
+    }
+    monkeypatch.setattr(vectors, "embed", lambda texts: [[1.0, 0.0] for _ in texts])
+    monkeypatch.setattr(groq_chat, "complete", lambda _, messages, structured=False, **options:
+                        '{"mode":"document","document_ids":[99999]}' if structured and "files" in messages[-1]["content"]
+                        else '{"document_answer":"Founded in 2017 [Source 1]."}' if structured else "Hello!")
+    app = create_app(config)
+    with app.app_context():
+        upgrade(directory=str(Path(__file__).resolve().parents[1] / "migrations"))
+    client = app.test_client()
+    account = client.post("/api/auth/register", json={
+        "name": "Owner", "email": "owner@example.com", "password": "test-password",
+    }).json
+    auth = {"Authorization": "Bearer " + account["access_token"]}
+    chat_id = client.post("/api/chat/conversations", headers=auth, json={}).json["id"]
+    chat = f"/api/chat/conversations/{chat_id}"
+    with pymupdf.open() as document:
+        document.new_page().insert_text((72, 72), "Novatek Systems was founded in 2017.")
+        raw = document.tobytes()
+        document.new_page().insert_text((72, 72), "Another unrelated file.")
+        second = document.tobytes()
+    response = client.post(chat + "/attachments", headers=auth, data={
+        "files": [(io.BytesIO(raw), "novatek.pdf"), (io.BytesIO(second), "second.pdf")],
+    })
+    first_id, second_id = [doc["id"] for doc in response.json]
+    assert [doc["status"] for doc in response.json] == ["uploaded", "uploaded"]
+    pending = client.post(chat + "/messages", headers=auth, json={"question": "When was Novatek founded?"})
+    assert "still processing" in pending.json["answer"]["content"]
+    duplicate = client.post(chat + "/attachments", headers=auth,
+                            data={"files": (io.BytesIO(raw), "novatek.pdf")})
+    assert duplicate.json[0]["id"] == first_id
+    assert not list((tmp_path / "uploads").iterdir())
+
+    restarted = create_app({**config, "UPLOAD_FOLDER": str(tmp_path / "new-uploads")})
+    reopened = restarted.test_client()
+    assert reopened.get(chat + "/attachments", headers=auth).json[0]["status"] == "uploaded"
+    with restarted.app_context():
+        assert document_jobs.process_next()
+    pdf_url = f"/api/documents/{first_id}/pdf"
+    assert reopened.get(pdf_url, headers=auth).data == raw
+    answer = reopened.post(chat + "/messages", headers=auth, json={"question": "When was Novatek founded?"})
+    assert answer.json["answer"]["sources"][0]["page_number"] == 1
+    other_account = reopened.post("/api/auth/register", json={
+        "name": "Other", "email": "other@example.com", "password": "other-password",
+    }).json
+    other = {"Authorization": "Bearer " + other_account["access_token"]}
+    assert reopened.delete(f"/api/documents/{first_id}", headers=other).status_code == 404
+    assert reopened.delete(f"/api/documents/{first_id}", headers=auth).status_code == 202
+    assert reopened.delete(f"/api/documents/{first_id}", headers=auth).status_code == 202
+    assert reopened.get(pdf_url, headers=auth).status_code == 404
+    assert [doc["id"] for doc in reopened.get(chat + "/attachments", headers=auth).json] == [second_id]
+    with restarted.app_context():
+        while document_jobs.process_next():
+            pass
+        assert db.session.get(Document, first_id) is None
+        assert db.session.get(DocumentFile, first_id) is None
+        assert not DocumentChunk.query.filter_by(document_id=first_id).count()
+        assert db.session.get(Document, second_id).status == "ready"
+        assert not vectors.retrieve(account["user"]["id"], "Novatek", document_ids=[first_id])
+        db.engine.dispose()
+    assert reopened.delete(f"/api/documents/{first_id}", headers=auth).status_code == 204
 
 
 def test_production_frontend_routes(tmp_path):

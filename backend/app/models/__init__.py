@@ -44,7 +44,10 @@ class RevokedToken(db.Model):
 
 class Document(db.Model):
     __tablename__ = "documents"
-    __table_args__ = (db.UniqueConstraint("user_id", "content_hash", name="uq_documents_owner_hash"),)
+    __table_args__ = (
+        db.UniqueConstraint("user_id", "content_hash", name="uq_documents_owner_hash"),
+        db.Index("ix_documents_owner_created", "user_id", "created_at"),
+    )
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     original_name = db.Column(db.String(255), nullable=False)
@@ -56,6 +59,8 @@ class Document(db.Model):
     content_hash = db.Column(db.String(64))
     created_at = db.Column(db.DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at = db.Column(db.DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    job_token = db.Column(db.String(36))
+    job_attempts = db.Column(db.Integer, default=0, server_default="0", nullable=False)
 
     def to_dict(self):
         return {"id": self.id, "name": self.original_name, "type": self.file_type,
@@ -63,8 +68,25 @@ class Document(db.Model):
                 "created_at": self.created_at.isoformat()}
 
 
+class DocumentFile(db.Model):
+    __tablename__ = "document_files"
+    document_id = db.Column(db.Integer, db.ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True)
+    data = db.Column(db.LargeBinary, nullable=False)
+
+
+class DocumentChunk(db.Model):
+    __tablename__ = "document_chunks"
+    document_id = db.Column(db.Integer, db.ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True)
+    position = db.Column(db.Integer, primary_key=True)
+    page_number = db.Column(db.Integer)
+    content = db.Column(db.Text, nullable=False)
+    embedding = db.Column(db.LargeBinary, nullable=False)
+    model = db.Column(db.String(255), nullable=False)
+
+
 class Conversation(db.Model):
     __tablename__ = "conversations"
+    __table_args__ = (db.Index("ix_conversations_owner_updated", "user_id", "updated_at"),)
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     title = db.Column(db.String(255), default="New conversation", nullable=False)
@@ -82,6 +104,7 @@ class Conversation(db.Model):
 
 class Message(db.Model):
     __tablename__ = "messages"
+    __table_args__ = (db.Index("ix_messages_conversation_order", "conversation_id", "id"),)
     id = db.Column(db.Integer, primary_key=True)
     conversation_id = db.Column(db.Integer, db.ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True)
     role = db.Column(db.String(20), nullable=False)

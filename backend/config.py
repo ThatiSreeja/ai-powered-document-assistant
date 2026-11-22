@@ -40,6 +40,8 @@ class Config:
     JWT_COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "Lax")
     JWT_CSRF_IN_COOKIES = False
     MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH", 16 * 1024 * 1024))
+    DOCUMENT_JOBS = os.getenv("DOCUMENT_JOBS", "true").lower() == "true"
+    DOCUMENT_WORKERS = min(2, max(1, int(os.getenv("DOCUMENT_WORKERS", "2"))))
     UPLOAD_FOLDER = str(BASE_DIR / os.getenv("UPLOAD_FOLDER", "uploads"))
     CHROMA_PATH = str(BASE_DIR / os.getenv("CHROMA_PATH", "vector_store"))
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -51,6 +53,7 @@ class Config:
     GROQ_TIMEOUT_SECONDS = float(os.getenv("GROQ_TIMEOUT_SECONDS", "30"))
     EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "").strip().lower()
     EMBEDDING_CACHE_PATH = Path(os.getenv("EMBEDDING_CACHE_PATH", Path.home() / ".cache" / "chroma" / "onnx_models"))
+    EMBEDDING_BUNDLED_CACHE = os.getenv("EMBEDDING_BUNDLED_CACHE")
     MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "1000"))
     MAX_EXTRACTED_CHARACTERS = int(os.getenv("MAX_EXTRACTED_CHARACTERS", "2000000"))
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")

@@ -32,6 +32,8 @@ def create_app(test_config=None):
     app = Flask(__name__)
     app.config.from_object(Config)
     if test_config:
+        if test_config.get("TESTING"):
+            app.config["DOCUMENT_JOBS"] = False
         app.config.update(test_config)
     if app.config["SQLALCHEMY_DATABASE_URI"].startswith(("postgresql://", "postgresql+")):
         app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {

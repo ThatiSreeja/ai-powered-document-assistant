@@ -1,10 +1,15 @@
 import chromadb
+import numpy as np
 from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
 from flask import current_app
 from functools import lru_cache
+from heapq import nsmallest
 from pathlib import Path
 from threading import Lock
 from openai import OpenAI
+from sqlalchemy import delete, func, insert, select, tuple_
+from app.extensions import db
+from app.models import Document, DocumentChunk, DocumentFile
 import requests
 import re
 
@@ -25,12 +30,16 @@ def _local_model(cache_path):
     return model
 
 
-def _collection():
-    client = chromadb.PersistentClient(path=current_app.config["CHROMA_PATH"])
+def _model_name():
     provider = _provider()
     model = {"local": "all-MiniLM-L6-v2", "ollama": current_app.config["OLLAMA_EMBEDDING_MODEL"],
              "openai": current_app.config["OPENAI_EMBEDDING_MODEL"]}[provider]
-    suffix = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{provider}_{model}")[:48]
+    return f"{provider}_{model}"
+
+
+def _collection():
+    client = chromadb.PersistentClient(path=current_app.config["CHROMA_PATH"])
+    suffix = re.sub(r"[^a-zA-Z0-9_-]", "_", _model_name())[:48]
     return client.get_or_create_collection(f"chunks_{suffix}", metadata={"hnsw:space": "cosine"})
 
 
@@ -38,8 +47,13 @@ def embed(texts):
     provider = _provider()
     if provider == "local":
         try:
+            cache = current_app.config["EMBEDDING_CACHE_PATH"]
+            bundled = current_app.config["EMBEDDING_BUNDLED_CACHE"]
+            model_dir = Path(ONNXMiniLM_L6_V2.MODEL_NAME) / "onnx" / "model.onnx"
+            if bundled and not (cache / model_dir).is_file():
+                cache = Path(bundled)
             with _model_lock:
-                model = _local_model(current_app.config["EMBEDDING_CACHE_PATH"])
+                model = _local_model(cache)
             return model(texts)
         except Exception:
             raise RuntimeError("The local embedding model is unavailable. Check the backend model cache and network.") from None
@@ -47,7 +61,7 @@ def embed(texts):
         url = current_app.config["OLLAMA_BASE_URL"] + "/api/embed"
         model = current_app.config["OLLAMA_EMBEDDING_MODEL"]
         try:
-            response = requests.post(url, json={"model": model, "input": texts}, timeout=(5, 300))
+            response = requests.post(url, json={"model": model, "input": texts}, timeout=(5, 120))
         except requests.ConnectionError as exc:
             raise RuntimeError("Ollama is not running. Start Ollama, then retry processing.") from exc
         if response.status_code == 404:
@@ -60,7 +74,7 @@ def embed(texts):
     key = current_app.config.get("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not configured")
-    client = OpenAI(api_key=key)
+    client = OpenAI(api_key=key, timeout=45, max_retries=0)
     vectors = []
     for offset in range(0, len(texts), 64):
         response = client.embeddings.create(
@@ -70,10 +84,38 @@ def embed(texts):
     return vectors
 
 
-def add_document(document, chunks):
+def embed_chunks(chunks):
+    texts = list(dict.fromkeys(chunk["text"] for chunk in chunks))
     vectors = []
-    for start in range(0, len(chunks), 64):
-        vectors.extend(embed([c["text"] for c in chunks[start:start + 64]]))
+    for start in range(0, len(texts), 64):
+        batch = texts[start:start + 64]
+        embedded = embed(batch)
+        if len(embedded) != len(batch):
+            raise RuntimeError("The embedding service returned incomplete results. Retry this document.")
+        vectors.extend(embedded)
+    by_text = dict(zip(texts, vectors))
+    return [by_text[chunk["text"]] for chunk in chunks]
+
+
+def store_chunks(document_id, chunks, vectors):
+    db.session.execute(delete(DocumentChunk).where(DocumentChunk.document_id == document_id))
+    model = _model_name()
+    db.session.execute(insert(DocumentChunk), [
+        {"document_id": document_id, "position": index, "page_number": chunk["page_number"],
+         "content": chunk["text"], "embedding": _unit_vector(vector).tobytes(),
+         "model": model}
+        for index, (chunk, vector) in enumerate(zip(chunks, vectors))
+    ])
+
+
+def _unit_vector(vector):
+    array = np.asarray(vector, dtype="<f4")
+    norm = np.linalg.norm(array)
+    return array / norm if norm else array
+
+
+def add_document(document, chunks):
+    vectors = embed_chunks(chunks)
     _collection().upsert(
         ids=[f"{document.id}:{i}" for i in range(len(chunks))],
         embeddings=vectors,
@@ -102,13 +144,85 @@ def retrieve(user_id, question, limit=6, *, document_ids=None, max_distance=0.55
 
 
 def _retrieve(user_id, question, limit, document_ids, max_distance, across_documents):
+    if current_app.config["DOCUMENT_JOBS"]:
+        indexed, legacy = _document_ids(user_id, document_ids)
+        if not indexed:
+            return _retrieve_legacy(user_id, question, limit, legacy, max_distance, across_documents)
+        query = np.asarray(embed([question])[0], dtype="<f4")
+        groups = [[doc_id] for doc_id in (indexed + legacy)[:10]] if across_documents else [indexed + legacy]
+        rows = []
+        for group in groups:
+            group_limit = 2 if len(groups) > 1 else limit
+            hits = _stored_hits(query, user_id, [doc for doc in group if doc in indexed], group_limit, max_distance)
+            legacy_group = [doc for doc in group if doc in legacy]
+            if legacy_group:
+                hits += _retrieve_legacy(user_id, question, group_limit, legacy_group, max_distance, False, [query.tolist()])
+            rows.extend(nsmallest(group_limit, hits, key=lambda hit: hit["distance"]))
+        return rows
+    return _retrieve_legacy(user_id, question, limit, document_ids, max_distance, across_documents)
+
+
+def _document_ids(user_id, document_ids):
+    query = select(Document.id, DocumentFile.document_id).outerjoin(DocumentFile).where(
+        Document.user_id == user_id, Document.status == "ready")
+    if document_ids is not None:
+        query = query.where(Document.id.in_(document_ids))
+    indexed, legacy = [], []
+    for document_id, stored in db.session.execute(query.order_by(Document.id.desc())):
+        (indexed if stored is not None else legacy).append(document_id)
+    return indexed, legacy
+
+
+def _stored_hits(query, user_id, document_ids, limit, max_distance):
+    if not document_ids:
+        return []
+    statement = select(DocumentChunk.document_id, DocumentChunk.position, DocumentChunk.embedding).join(Document).where(
+        Document.user_id == user_id, Document.status == "ready",
+        Document.id.in_(document_ids), DocumentChunk.model == _model_name(),
+    ).execution_options(yield_per=128)
+    query = _unit_vector(query)
+    if not query.any():
+        return []
+
+    def matches():
+        for batch in db.session.execute(statement).partitions():
+            embeddings = [(document_id, position, np.frombuffer(raw, dtype="<f4"))
+                          for document_id, position, raw in batch if len(raw) == query.nbytes]
+            if not embeddings:
+                continue
+            distances = 1 - np.clip(np.stack([row[2] for row in embeddings]) @ query, -1, 1)
+            for (document_id, position, embedding), distance in zip(embeddings, distances):
+                if distance <= max_distance and embedding.any():
+                    yield float(distance), document_id, position
+
+    selected = nsmallest(limit, matches())
+    if not selected:
+        return []
+    keys = [(document_id, position) for _, document_id, position in selected]
+    passages = {
+        (chunk.document_id, chunk.position): _stored_passage(chunk, name)
+        for chunk, name in db.session.execute(select(DocumentChunk, Document.original_name).join(Document).where(
+            Document.user_id == user_id, Document.status == "ready",
+            tuple_(DocumentChunk.document_id, DocumentChunk.position).in_(keys),
+        ))
+    }
+    return [{**passages[key], "distance": hit[0]} for hit, key in zip(selected, keys) if key in passages]
+
+
+def _stored_passage(chunk, name):
+    return {"text": chunk.content, "metadata": {"document_id": chunk.document_id,
+            "document_name": name, "page_number": chunk.page_number}}
+
+
+def _retrieve_legacy(user_id, question, limit, document_ids, max_distance, across_documents, query_embedding=None):
     if document_ids == []:
         return []
     collection = _collection()
     count = collection.count()
     if count == 0:
         return []
-    query_embedding = embed([question])
+    if query_embedding is None:
+        query_embedding = embed([question])
     groups = [[doc_id] for doc_id in document_ids[:10]] if across_documents and document_ids else [document_ids]
     rows = []
     for group in groups:
@@ -129,6 +243,20 @@ def overview(user_id, document_ids):
     rows = []
     samples = min(10, max(2, 36 // len(document_ids)))
     try:
+        if current_app.config["DOCUMENT_JOBS"]:
+            indexed, document_ids = _document_ids(user_id, document_ids)
+            for document_id in indexed:
+                base = select(DocumentChunk, Document.original_name).join(Document).where(
+                    Document.id == document_id, Document.user_id == user_id, Document.status == "ready",
+                    DocumentChunk.model == _model_name())
+                count = db.session.scalar(select(func.count()).select_from(base.subquery()))
+                positions = [round(i * (count - 1) / (samples - 1)) for i in range(samples)]
+                if count > samples:
+                    base = base.where(DocumentChunk.position.in_(positions))
+                rows.extend(_stored_passage(chunk, name) for chunk, name in db.session.execute(
+                    base.order_by(DocumentChunk.position)))
+            if not document_ids:
+                return rows
         collection = _collection()
         for document_id in document_ids:
             data = collection.get(where={"$and": [{"user_id": user_id}, {"document_id": document_id}]},

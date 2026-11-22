@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
+from time import perf_counter
 from flask import Blueprint, current_app, jsonify, request, send_file
 from flask_jwt_extended import (
     create_access_token, get_csrf_token, get_jwt, get_jwt_identity, jwt_required,
@@ -10,6 +12,7 @@ from app.extensions import db
 from app.models import Conversation, Document, Message, RevokedToken, User, utcnow
 from app.services.documents import extract_pages
 from app.services.ingestion import ingest, process_document
+from app.services.document_jobs import enqueue, file_source, PROCESSING
 from app.services.rag import answer_question, summarize
 from app.services.groq_chat import GroqError
 from app.services.vectors import delete_document
@@ -29,7 +32,7 @@ def groq_error(exc):
 
 
 def owned_document(document_id, user_id, *, lock=False):
-    query = Document.query.filter_by(id=document_id, user_id=user_id)
+    query = Document.query.filter_by(id=document_id, user_id=user_id).filter(Document.status != "deleting")
     return (query.with_for_update() if lock else query).first()
 
 
@@ -114,7 +117,7 @@ def me():
 def documents():
     user_id = int(get_jwt_identity())
     if request.method == "GET":
-        query = Document.query.filter_by(user_id=user_id)
+        query = Document.query.filter_by(user_id=user_id).filter(Document.status != "deleting")
         search = request.args.get("q", "").strip()
         kind, status = request.args.get("type"), request.args.get("status")
         if search:
@@ -133,6 +136,7 @@ def owned_conversation(conversation_id, user_id, *, lock=False):
 
 
 def upload_documents(user_id, conversation_id=None):
+    started = perf_counter()
     files = request.files.getlist("files")
     if not files or len(files) > MAX_ATTACHMENTS:
         return error(f"Select between 1 and {MAX_ATTACHMENTS} files.")
@@ -159,6 +163,8 @@ def upload_documents(user_id, conversation_id=None):
         result = doc.to_dict()
         db.session.commit()
         results.append(result)
+    if current_app.config["DOCUMENT_JOBS"]:
+        current_app.logger.info("Document upload accepted files=%s duration=%.3fs", len(results), perf_counter() - started)
     return jsonify(results), 201
 
 
@@ -175,10 +181,11 @@ def view_pdf(document_id):
     doc = owned_document(document_id, int(get_jwt_identity()))
     if not doc or doc.file_type != "pdf" or doc.status != "ready":
         return error("PDF not found.", 404)
-    path = Path(current_app.config["UPLOAD_FOLDER"]) / doc.stored_name
-    if not path.is_file():
+    source = file_source(doc)
+    if source is None:
         return error("PDF file is unavailable.", 404)
-    response = send_file(path, mimetype="application/pdf", download_name=doc.original_name)
+    response = send_file(BytesIO(source) if isinstance(source, bytes) else source,
+                         mimetype="application/pdf", download_name=doc.original_name)
     response.headers["Cache-Control"] = "private, no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
     return response
@@ -187,6 +194,18 @@ def view_pdf(document_id):
 @api.delete("/documents/<int:document_id>")
 @jwt_required()
 def remove_document(document_id):
+    if current_app.config["DOCUMENT_JOBS"]:
+        doc = Document.query.filter_by(id=document_id).with_for_update().first()
+        if doc is None:
+            return "", 204
+        if doc.user_id != int(get_jwt_identity()):
+            return error("Document not found.", 404)
+        if doc.status != "deleting":
+            doc.status = "deleting"
+            doc.job_token = None
+            doc.job_attempts = 0
+            db.session.commit()
+        return jsonify({"message": "Document removed. Cleanup queued."}), 202
     doc = owned_document(document_id, int(get_jwt_identity()), lock=True)
     if not doc:
         return error("Document not found.", 404)
@@ -208,6 +227,13 @@ def reprocess_document(document_id):
     doc = owned_document(document_id, int(get_jwt_identity()), lock=True)
     if not doc:
         return error("Document not found.", 404)
+    if current_app.config["DOCUMENT_JOBS"]:
+        if doc.status not in ("uploaded", *PROCESSING):
+            if file_source(doc) is None:
+                return error("The original file is unavailable. Upload it again.", 409)
+            enqueue(doc)
+            db.session.commit()
+        return jsonify(doc.to_dict()), 202
     process_document(doc, retry=True)
     db.session.commit()
     return jsonify(doc.to_dict())
@@ -232,7 +258,18 @@ def get_conversation(conversation_id):
     conv = Conversation.query.filter_by(id=conversation_id, user_id=int(get_jwt_identity())).first()
     if not conv:
         return error("Conversation not found.", 404)
-    return jsonify({**conv.to_dict(True), "attachments": [doc.to_dict() for doc in conv.documents if doc.user_id == conv.user_id]})
+    return jsonify({**conv.to_dict(True), "attachments": [doc.to_dict() for doc in conv.documents
+                    if doc.user_id == conv.user_id and doc.status != "deleting"]})
+
+
+@api.get("/chat/conversations/<int:conversation_id>/attachments")
+@jwt_required()
+def attachment_status(conversation_id):
+    conv = owned_conversation(conversation_id, int(get_jwt_identity()))
+    if not conv:
+        return error("Conversation not found.", 404)
+    return jsonify([doc.to_dict() for doc in conv.documents
+                    if doc.user_id == conv.user_id and doc.status != "deleting"])
 
 
 @api.delete("/chat/conversations/<int:conversation_id>")
@@ -283,6 +320,7 @@ def send_message(conversation_id):
         if remaining <= 0:
             break
     history.reverse()
+    started = perf_counter()
     try:
         answer, sources = answer_question(uid, question, history, conversation_id=conv.id)
     except GroqError:
@@ -297,6 +335,8 @@ def send_message(conversation_id):
     conv.updated_at = utcnow()
     db.session.add_all([user_message, assistant])
     db.session.commit()
+    if current_app.config["DOCUMENT_JOBS"]:
+        current_app.logger.info("Chat response duration=%.3fs citations=%s", perf_counter() - started, len(sources))
     return jsonify({"user_message": user_message.to_dict(), "answer": assistant.to_dict()})
 
 
@@ -361,7 +401,12 @@ def ai_summarize():
     if not doc:
         return error("Document not found.", 404)
     try:
-        pages = extract_pages(Path(current_app.config["UPLOAD_FOLDER"]) / doc.stored_name, "." + doc.file_type)
+        if doc.status != "ready":
+            return error(doc.error_message or "This document is still processing.", 409)
+        source = file_source(doc)
+        if source is None:
+            return error("The original file is unavailable. Upload it again.", 409)
+        pages = extract_pages(source, "." + doc.file_type)
         text = "\n".join(content for _, content in pages)
         return jsonify({"summary": summarize(text, bool(data.get("detailed"))), "document": doc.to_dict()})
     except GroqError:
@@ -395,7 +440,7 @@ def semantic_search():
 @jwt_required()
 def dashboard():
     uid = int(get_jwt_identity())
-    docs = Document.query.filter_by(user_id=uid)
+    docs = Document.query.filter_by(user_id=uid).filter(Document.status != "deleting")
     return jsonify({"total_documents": docs.count(), "ready_documents": docs.filter_by(status="ready").count(),
                     "failed_documents": docs.filter_by(status="failed").count(),
                     "total_conversations": Conversation.query.filter_by(user_id=uid).count(),

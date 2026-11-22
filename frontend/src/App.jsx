@@ -1,7 +1,8 @@
-import { createContext, useContext, useEffect, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { Link, Navigate, NavLink, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { Activity, ArrowUpRight, FileText, FolderOpen, LayoutDashboard, LogOut, MessageSquare, Plus, Search, Send, Settings, ShieldCheck, Sparkles, Trash2, UploadCloud, BookOpen, RefreshCw } from 'lucide-react'
 import Chat from './Chat'
+import { documentStatus, isProcessing, prepareUploads, useDocumentPolling } from './services/documentJobs'
 import api, { sessionHeaders, setCsrfToken } from './services/api'
 
 const Auth = createContext(null)
@@ -48,17 +49,91 @@ function PageTitle({eyebrow,title,subtitle,action}) { return <div className="pag
 function Dashboard() {
   const [data,setData]=useState(null); const [error,setError]=useState('')
   useEffect(()=>{api.get('/dashboard/summary').then(r=>setData(r.data)).catch(e=>setError(e.response?.data?.error||'Could not load dashboard'))},[])
-  return <><PageTitle eyebrow="YOUR WORKSPACE" title="Good to see you." subtitle="Your documents, organized and ready for a conversation." action={<Link className="button primary" to="/app/chat"><Plus size={16}/> Attach PDFs in chat</Link>}/>{error&&<div className="alert">{error}</div>}<div className="stat-grid">{[["Total documents",data?.total_documents??'—',FileText,data?.total_documents === 0 ? "No documents yet" : "Files in your library"],["Ready to chat",data?.ready_documents??'—',Sparkles,"AI indexed documents"],["Conversations",data?.total_conversations??'—',MessageSquare,"Your recent sessions"]].map(([label,value,Icon,hint])=><article className="stat-card" key={label}><div className="stat-top"><span>{label}</span><Icon size={18}/></div><strong>{value}</strong><small>{hint}</small></article>)}</div><div className="section-heading"><div><h2>Recent documents</h2><p>Your latest uploads and processing status</p></div><Link className="text-link" to="/app/documents">View all <ArrowUpRight size={14}/></Link></div><div className="panel table-panel">{data?.recent_documents?.length?<table><thead><tr><th>DOCUMENT</th><th>TYPE</th><th>STATUS</th><th>ADDED</th></tr></thead><tbody>{data.recent_documents.map(d=><tr key={d.id}><td><FileText className="file-icon" size={17}/><b>{d.name}</b></td><td>{d.type.toUpperCase()}</td><td><span className={`badge ${d.status}`}>{d.status}</span></td><td>{new Date(d.created_at).toLocaleDateString()}</td></tr>)}</tbody></table>:<Empty icon={FileText} title="Your library starts here" body="Upload a document and Paperwise will make it ready to search and chat." action={<Link className="button primary" to="/app/chat"><UploadCloud size={16}/> Attach PDFs in chat</Link>}/>}</div><div className="tip-card"><span className="tip-icon"><Sparkles size={18}/></span><div><b>A little tip</b><p>Ask a focused question to get the most useful answer. Paperwise cites the documents it uses so you can check the source.</p></div><Link to="/app/chat" className="text-link">Start a chat <ArrowUpRight size={14}/></Link></div></>
+  return <><PageTitle eyebrow="YOUR WORKSPACE" title="Good to see you." subtitle="Your documents, organized and ready for a conversation." action={<Link className="button primary" to="/app/chat"><Plus size={16}/> Attach PDFs in chat</Link>}/>{error&&<div className="alert">{error}</div>}<div className="stat-grid">{[["Total documents",data?.total_documents??'—',FileText,data?.total_documents === 0 ? "No documents yet" : "Files in your library"],["Ready to chat",data?.ready_documents??'—',Sparkles,"AI indexed documents"],["Conversations",data?.total_conversations??'—',MessageSquare,"Your recent sessions"]].map(([label,value,Icon,hint])=><article className="stat-card" key={label}><div className="stat-top"><span>{label}</span><Icon size={18}/></div><strong>{value}</strong><small>{hint}</small></article>)}</div><div className="section-heading"><div><h2>Recent documents</h2><p>Your latest uploads and processing status</p></div><Link className="text-link" to="/app/documents">View all <ArrowUpRight size={14}/></Link></div><div className="panel table-panel">{data?.recent_documents?.length?<table><thead><tr><th>DOCUMENT</th><th>TYPE</th><th>STATUS</th><th>ADDED</th></tr></thead><tbody>{data.recent_documents.map(d=><tr key={d.id}><td><FileText className="file-icon" size={17}/><b>{d.name}</b></td><td>{d.type.toUpperCase()}</td><td><span className={`badge ${d.status}`}>{documentStatus(d.status)}</span></td><td>{new Date(d.created_at).toLocaleDateString()}</td></tr>)}</tbody></table>:<Empty icon={FileText} title="Your library starts here" body="Upload a document and Paperwise will make it ready to search and chat." action={<Link className="button primary" to="/app/chat"><UploadCloud size={16}/> Attach PDFs in chat</Link>}/>}</div><div className="tip-card"><span className="tip-icon"><Sparkles size={18}/></span><div><b>A little tip</b><p>Ask a focused question to get the most useful answer. Paperwise cites the documents it uses so you can check the source.</p></div><Link to="/app/chat" className="text-link">Start a chat <ArrowUpRight size={14}/></Link></div></>
 }
 function Empty({icon:Icon,title,body,action}) { return <div className="empty-state"><span><Icon size={23}/></span><h3>{title}</h3><p>{body}</p>{action}</div> }
 function Documents() {
-  const [docs,setDocs]=useState([]),[busy,setBusy]=useState(false),[message,setMessage]=useState(''),[query,setQuery]=useState(()=>new URLSearchParams(window.location.search).get('q')||'')
-  const load=()=>api.get('/documents',{params:{q:query}}).then(r=>setDocs(r.data)).catch(e=>setMessage(e.response?.data?.error||'Could not load documents'))
-  useEffect(()=>{load()},[query])
-  async function upload(files){if(!files?.length)return;setBusy(true);setMessage('');try{const form=new FormData();[...files].forEach(f=>form.append('files',f));const {data}=await api.post('/documents',form,{headers:{'Content-Type':'multipart/form-data'}});const failed=data.filter(x=>x.error||x.status==='failed');setMessage(failed.length?`${failed.map(file => (file.name || 'File') + ' - ' + (file.error || 'Processing failed.')).join(' ')}`:`Uploaded ${data.length} file(s).`);load()}catch(e){setMessage(e.response?.data?.error||'Upload failed.')}finally{setBusy(false)}}
-  async function remove(id){try{await api.delete(`/documents/${id}`);setDocs(docs.filter(d=>d.id!==id))}catch(e){setMessage(e.response?.data?.error||'Could not delete document')}}
-  async function retry(id){setDocs(rows=>rows.map(doc=>doc.id===id?{...doc,status:'processing',error:null}:doc));setMessage('');try{const {data}=await api.post(`/documents/${id}/reprocess`);setDocs(rows=>rows.map(doc=>doc.id===id?data:doc));setMessage(data.status==='ready'?'Document processed and ready to chat.':data.error||'Processing failed.')}catch(e){setMessage(e.response?.data?.error||'Could not reprocess document.')}}
-  return <><PageTitle eyebrow="YOUR LIBRARY" title="Documents" subtitle="Add files, track processing, and manage your knowledge base." action={<label className="button primary upload-button"><UploadCloud size={16}/>{busy?'Uploading…':'Upload files'}<input type="file" multiple accept=".pdf,.docx,.txt" onChange={e=>upload(e.target.files)}/></label>}/><div className="upload-zone" onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();upload(e.dataTransfer.files)}}><span className="upload-icon"><UploadCloud size={22}/></span><div><b>Drop your files here</b><p>PDF, DOCX or TXT · up to 16 MB per upload</p></div><label className="button secondary">Browse files<input type="file" multiple accept=".pdf,.docx,.txt" onChange={e=>upload(e.target.files)}/></label></div>{message&&<div className="alert">{message}</div>}<div className="filter-row"><div className="search-input"><Search size={16}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search documents"/></div><span className="muted">{docs.length} {docs.length===1?'document':'documents'}</span></div><div className="panel table-panel">{docs.length?<table><thead><tr><th>DOCUMENT</th><th>SIZE</th><th>STATUS</th><th>UPLOADED</th><th/></tr></thead><tbody>{docs.map(d=><tr key={d.id}><td><FileText className="file-icon" size={17}/><div><b>{d.name}</b><small className="cell-sub">{d.type.toUpperCase()}</small></div></td><td>{(d.size/1024).toFixed(0)} KB</td><td><span className={`badge ${d.status}`}>{d.status}</span>{d.error&&<small className="cell-sub error-text">{d.error}</small>}</td><td>{new Date(d.created_at).toLocaleDateString()}</td><td className="row-actions">{d.status==='failed'&&<button className="icon-button" onClick={()=>retry(d.id)} title="Retry processing"><RefreshCw size={15}/></button>}<button className="icon-button danger" onClick={()=>remove(d.id)} title="Delete document"><Trash2 size={15}/></button></td></tr>)}</tbody></table>:<Empty icon={FolderOpen} title="No documents yet" body="Upload your first PDF, DOCX or TXT file to get started."/>}</div></>
+  const [docs, setDocs] = useState([])
+  const [pending, setPending] = useState([])
+  const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState(null)
+  const [deleting, setDeleting] = useState(0)
+  const [message, setMessage] = useState('')
+  const [query, setQuery] = useState(() => new URLSearchParams(window.location.search).get('q') || '')
+  const hidden = useRef(new Set())
+  const updateDocs = useCallback(rows => setDocs(rows.filter(doc => !hidden.current.has(doc.id))), [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => api.get('/documents', { params: { q: query }, signal: controller.signal })
+      .then(({ data }) => { if (!controller.signal.aborted) updateDocs(data) })
+      .catch(error => { if (!controller.signal.aborted) setMessage(error.response?.data?.error || 'Could not load documents.') }), 250)
+    return () => { clearTimeout(timer); controller.abort() }
+  }, [query, updateDocs])
+  useDocumentPolling('/documents', !busy && docs.some(isProcessing), updateDocs, query)
+
+  async function upload(files) {
+    if (!files?.length || busy) return
+    const entries = prepareUploads(files)
+    const valid = entries.filter(file => !file.error)
+    setPending(entries)
+    setMessage('')
+    setProgress(null)
+    if (!valid.length) return
+    setBusy(true)
+    try {
+      const form = new FormData()
+      valid.forEach(entry => form.append('files', entry.file))
+      const { data } = await api.post('/documents', form, { onUploadProgress: event => {
+        if (event.total) setProgress(Math.floor(100 * event.loaded / event.total))
+        if (event.total && event.loaded >= event.total) {
+          setPending(rows => rows.map(row => row.error ? row : { ...row, status: 'uploaded' }))
+        }
+      } })
+      setPending([...entries.filter(row => row.error), ...data.flatMap((doc, index) =>
+        doc.id ? [] : [{ ...valid[index], status: 'failed', error: doc.error || 'Upload failed.' }])])
+      const accepted = data.filter(doc => doc.id && doc.name.toLowerCase().includes(query.trim().toLowerCase()))
+      setDocs(rows => [...accepted.filter(doc => !hidden.current.has(doc.id)),
+        ...rows.filter(row => !accepted.some(doc => doc.id === row.id))])
+    } catch (error) {
+      const reason = error.response?.data?.error || 'Upload failed. Select the files to retry.'
+      setPending(entries.map(row => ({ ...row, status: 'failed', error: row.error || reason })))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function remove(document) {
+    if (!window.confirm('Permanently delete this document?')) return
+    hidden.current.add(document.id)
+    setDocs(rows => rows.filter(row => row.id !== document.id))
+    setDeleting(count => count + 1)
+    try {
+      await api.delete('/documents/' + document.id)
+    } catch (error) {
+      hidden.current.delete(document.id)
+      setDocs(rows => [document, ...rows.filter(row => row.id !== document.id)])
+      setMessage(error.response?.data?.error || 'Could not delete document.')
+    } finally {
+      setDeleting(count => count - 1)
+    }
+  }
+
+  async function retry(document) {
+    setMessage('')
+    try {
+      const { data } = await api.post('/documents/' + document.id + '/reprocess')
+      setDocs(rows => rows.map(doc => doc.id === document.id ? data : doc))
+    } catch (error) {
+      setMessage(error.response?.data?.error || 'Could not reprocess document.')
+    }
+  }
+  return <><PageTitle eyebrow="YOUR LIBRARY" title="Documents" subtitle="Add files, track processing, and manage your knowledge base." action={<label className="button primary upload-button"><UploadCloud size={16}/>{busy?'Uploading…':'Upload files'}<input type="file" multiple accept=".pdf,.docx,.txt" disabled={busy} onChange={e=>{upload(e.target.files); e.target.value=''}}/></label>}/><div className="upload-zone" onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();upload(e.dataTransfer.files)}}><span className="upload-icon"><UploadCloud size={22}/></span><div><b>Drop your files here</b><p>PDF, DOCX or TXT · up to 16 MB per upload</p></div><label className="button secondary">Browse files<input type="file" multiple accept=".pdf,.docx,.txt" disabled={busy} onChange={e=>{upload(e.target.files); e.target.value=''}}/></label></div>{message&&<div className="alert">{message}</div>}
+    {deleting > 0 && <p role="status">Removing documents…</p>}
+    {busy && progress !== null && <progress value={progress} max="100" aria-label="File transfer progress" />}
+    {pending.length > 0 && <ul aria-label="Selected uploads">{pending.map(file =>
+      <li key={file.index}>{file.name} · {documentStatus(file.status)}{file.error && <span className="error-text"> · {file.error}</span>}</li>)}</ul>}
+    <div className="filter-row"><div className="search-input"><Search size={16}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search documents"/></div><span className="muted">{docs.length} {docs.length===1?'document':'documents'}</span></div><div className="panel table-panel">{docs.length?<table><thead><tr><th>DOCUMENT</th><th>SIZE</th><th>STATUS</th><th>UPLOADED</th><th/></tr></thead><tbody>{docs.map(d=><tr key={d.id}><td><FileText className="file-icon" size={17}/><div><b>{d.name}</b><small className="cell-sub">{d.type.toUpperCase()}</small></div></td><td>{(d.size/1024).toFixed(0)} KB</td><td><span className={`badge ${d.status}`}>{documentStatus(d.status)}</span>{d.error&&<small className="cell-sub error-text">{d.error}</small>}</td><td>{new Date(d.created_at).toLocaleDateString()}</td><td className="row-actions">{d.status==='failed'&&<button className="icon-button" onClick={()=>retry(d)} title="Retry processing"><RefreshCw size={15}/></button>}<button className="icon-button danger" onClick={()=>remove(d)} title="Delete document"><Trash2 size={15}/></button></td></tr>)}</tbody></table>:<Empty icon={FolderOpen} title="No documents yet" body="Upload your first PDF, DOCX or TXT file to get started."/>}</div></>
 }
 function History() {
   const [rows, setRows] = useState([])

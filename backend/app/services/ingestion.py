@@ -5,9 +5,10 @@ from uuid import uuid4
 from flask import current_app
 
 from app.extensions import db
-from app.models import Document, ProcessingLog, User
+from app.models import Document, DocumentFile, ProcessingLog, User
 from app.services.documents import chunk_pages, extract_pages
 from app.services.vectors import add_document, delete_document
+from app.services.document_jobs import enqueue, has_stored_file
 
 MIME = {
     ".pdf": "application/pdf",
@@ -51,15 +52,42 @@ def ingest(file, user_id, *, pdf_only=False):
         if b"%PDF-" not in header:
             raise ValueError("The file is not a valid PDF.")
 
-    digest = hashlib.file_digest(file.stream, "sha256").hexdigest()
+    checksum = hashlib.sha256()
+    for block in iter(lambda: file.stream.read(1024 * 1024), b""):
+        checksum.update(block)
+    digest = checksum.hexdigest()
     file.stream.seek(0)
     # Serialize ingestion for this owner so duplicate requests reuse the completed document.
     User.query.filter_by(id=user_id).with_for_update().one()
-    existing = Document.query.filter_by(user_id=user_id, content_hash=digest).first()
+    existing = Document.query.filter_by(user_id=user_id, content_hash=digest).with_for_update().first()
+    if existing and existing.file_type != extension[1:]:
+        raise ValueError("These bytes were previously uploaded with a different file type.")
+    if current_app.config["DOCUMENT_JOBS"]:
+        if existing and existing.status == "deleting":
+            raise ValueError("This document is being deleted. Retry the upload in a moment.")
+        document = existing or Document(
+            user_id=user_id, original_name=name[:255], stored_name=f"{user_id}/{uuid4().hex}{extension}",
+            file_type=extension[1:], content_hash=digest, file_size=0,
+        )
+        if existing and has_stored_file(existing.id):
+            if existing.status == "failed":
+                enqueue(existing)
+            return existing
+        if existing and existing.status == "ready":
+            root = Path(current_app.config["UPLOAD_FOLDER"])
+            if (root / existing.stored_name).is_file() and (
+                Path(current_app.config["CHROMA_PATH"]) / "chroma.sqlite3"
+            ).is_file():
+                return existing
+        data = file.stream.read()
+        document.file_size = len(data)
+        enqueue(document)
+        db.session.add(document)
+        db.session.flush()
+        db.session.add(DocumentFile(document_id=document.id, data=data))
+        return document
     upload_root = Path(current_app.config["UPLOAD_FOLDER"])
     if existing:
-        if existing.file_type != extension[1:]:
-            raise ValueError("These bytes were previously uploaded with a different file type.")
         path = upload_root / existing.stored_name
         if path.is_file() and existing.status == "ready":
             return existing

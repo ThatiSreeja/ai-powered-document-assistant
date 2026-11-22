@@ -1,8 +1,12 @@
+import io
 import re
 from pathlib import Path
+from threading import Lock
 import pymupdf
 from docx import Document as DocxDocument
 from flask import current_app, has_app_context
+
+_pdf_lock = Lock()
 
 
 def extract_pages(path, extension):
@@ -11,7 +15,9 @@ def extract_pages(path, extension):
         page_limit = config.get("MAX_PDF_PAGES", 1000)
         char_limit = config.get("MAX_EXTRACTED_CHARACTERS", 2000000)
         try:
-            with pymupdf.open(path) as pdf:
+            with _pdf_lock, (
+                pymupdf.open(stream=path, filetype="pdf") if isinstance(path, bytes) else pymupdf.open(path)
+            ) as pdf:
                 if not pdf.is_pdf or pdf.is_repaired:
                     raise ValueError("The file is damaged or is not a valid PDF.")
                 if pdf.needs_pass:
@@ -29,10 +35,12 @@ def extract_pages(path, extension):
         except pymupdf.FileDataError:
             raise ValueError("The file is damaged or is not a valid PDF.") from None
     if extension == ".docx":
-        doc = DocxDocument(path)
+        doc = DocxDocument(io.BytesIO(path) if isinstance(path, bytes) else path)
         text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
         return [(None, text)]
-    return [(None, Path(path).read_text(encoding="utf-8", errors="replace"))]
+    text = path.decode("utf-8", errors="replace") if isinstance(path, bytes) else Path(path).read_text(
+        encoding="utf-8", errors="replace")
+    return [(None, text)]
 
 
 def chunk_pages(pages, size=1000, overlap=150):
