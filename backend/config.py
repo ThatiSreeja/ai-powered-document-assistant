@@ -11,7 +11,10 @@ class Config:
         "DATABASE_URL",
         "mysql+pymysql://root:password@localhost:3306/document_assistant?charset=utf8mb4",
     )
+    if SQLALCHEMY_DATABASE_URI.startswith("postgres://"):
+        SQLALCHEMY_DATABASE_URI = SQLALCHEMY_DATABASE_URI.replace("postgres://", "postgresql://", 1)
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    FRONTEND_DIST = os.getenv("FRONTEND_DIST")
     JWT_ACCESS_TOKEN_EXPIRES = 3600
     MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH", 16 * 1024 * 1024))
     UPLOAD_FOLDER = str(BASE_DIR / os.getenv("UPLOAD_FOLDER", "uploads"))

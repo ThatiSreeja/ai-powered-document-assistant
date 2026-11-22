@@ -31,3 +31,22 @@ def test_reject_unsupported_document(client, auth):
 
 def test_health_endpoint(client):
     assert client.get("/api/health").json == {"status": "ok", "database": "ok"}
+
+
+def test_production_frontend_routes(tmp_path):
+    from app import create_app
+
+    (tmp_path / "index.html").write_text("Paperwise frontend", encoding="utf-8")
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "test.js").write_text("export {};", encoding="utf-8")
+    app = create_app({"TESTING": True, "SQLALCHEMY_DATABASE_URI": "sqlite://",
+                      "FRONTEND_DIST": str(tmp_path), "UPLOAD_FOLDER": str(tmp_path / "uploads"),
+                      "CHROMA_PATH": str(tmp_path / "vectors"), "RATELIMIT_DEFAULT": "1 per hour"})
+    with app.test_client() as client:
+        for url in ("/", "/app/chat", "/app/history", "/login"):
+            assert client.get(url).data == b"Paperwise frontend"
+        assert client.get("/assets/test.js").cache_control.max_age == 31536000
+        assert client.get("/assets/absent.js").status_code == 404
+        assert client.get("/api/absent").status_code == 404
+        assert client.get("/api/health").is_json

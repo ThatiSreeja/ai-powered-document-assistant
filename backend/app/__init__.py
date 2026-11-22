@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_from_directory
+from werkzeug.middleware.proxy_fix import ProxyFix
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from flask_cors import CORS
@@ -21,13 +22,16 @@ def create_app(test_config=None):
     migrate.init_app(app, db)
     jwt.init_app(app)
     CORS(app, origins=app.config["CORS_ORIGINS"])
-    Limiter(get_remote_address, app=app, default_limits=["300 per hour"],
-            storage_uri=app.config["RATELIMIT_STORAGE_URI"])
+    if os.getenv("RENDER") == "true":
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+    limiter = Limiter(get_remote_address, app=app, default_limits=["300 per hour"],
+                      storage_uri=app.config["RATELIMIT_STORAGE_URI"])
     from app.models import User, Document, Conversation, Message, ProcessingLog
     from app.routes.api import api
     app.register_blueprint(api)
 
     @app.get("/api/health")
+    @limiter.exempt
     def health():
         try:
             db.session.execute(text("SELECT 1"))
@@ -50,11 +54,27 @@ def create_app(test_config=None):
     def database_error(exc):
         db.session.rollback()
         app.logger.error("Database request failed: %s", exc.__class__.__name__)
-        return jsonify({"error": "Database unavailable. Check that MySQL 8 is running and backend/.env has the correct DATABASE_URL."}), 503
+        return jsonify({"error": "Database unavailable. Check the database connection and try again."}), 503
 
     @app.errorhandler(500)
     def server_error(_):
         app.logger.exception("Unhandled application error")
         return jsonify({"error": "An unexpected server error occurred."}), 500
+
+    dist = app.config["FRONTEND_DIST"]
+    if dist:
+        @app.get("/assets/<path:filename>")
+        @limiter.exempt
+        def frontend_asset(filename):
+            return send_from_directory(Path(dist) / "assets", filename, max_age=31536000)
+
+        @app.get("/")
+        @app.get("/login")
+        @app.get("/register")
+        @app.get("/app")
+        @app.get("/app/<path:route>")
+        @limiter.exempt
+        def frontend(route=None):
+            return send_from_directory(dist, "index.html", max_age=0)
 
     return app
