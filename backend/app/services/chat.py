@@ -72,7 +72,7 @@ def answer(user_id, question, history, *, conversation_id=None):
     query = route.get("query")
     query = query.strip()[:4000] if isinstance(query, str) and query.strip() else question
     inferred = mode == "general"
-    if inferred and (conversation_id is None or not ready):
+    if inferred and (conversation_id is None or not ready or waiting):
         return groq_chat.complete(GENERAL, messages), []
     across = route.get("across_documents") is True or len(requested) > 1
     broad = not inferred and route.get("overview") is True

@@ -240,6 +240,12 @@ def test_document_jobs_survive_restart_and_delete_safely(persistent_database, tm
     assert reopened.get(pdf_url, headers=auth).data == raw
     answer = reopened.post(chat + "/messages", headers=auth, json={"question": "When was Novatek founded?"})
     assert answer.json["answer"]["sources"][0]["page_number"] == 1
+    with monkeypatch.context() as general_chat:
+        general_chat.setattr(groq_chat, "complete", lambda *_, structured=False, **options:
+                           '{"mode":"general"}' if structured else "Paris")
+        general_chat.setattr(vectors, "embed", lambda _: pytest.fail("General chat waited for document embeddings"))
+        answer = reopened.post(chat + "/messages", headers=auth, json={"question": "What is the capital of France?"})
+        assert answer.json["answer"]["content"] == "Paris"
     other_account = reopened.post("/api/auth/register", json={
         "name": "Other", "email": "other@example.com", "password": "other-password",
     }).json
