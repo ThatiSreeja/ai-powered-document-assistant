@@ -111,6 +111,68 @@ def pdf(text, page_number=1):
         return io.BytesIO(file.tobytes())
 
 
+def test_novatek_hybrid_retrieval_preserves_evidence_and_scope(client, auth, app, monkeypatch):
+    from app.extensions import db
+    from app.models import DocumentChunk
+    from app.services import document_jobs
+
+    app.config["DOCUMENT_JOBS"] = True
+    # Make every query miss the old cosine cutoff so this exercises the keyword path.
+    monkeypatch.setattr(vectors, "embed", lambda texts: [
+        [1.0, 0.0] if text.startswith(("Novatek facts.", "Orchard facts.")) else [0.0, 1.0]
+        for text in texts
+    ])
+    with pymupdf.open() as profile:
+        for fact in (
+            "Founded: 2018. Headquarters: Hyderabad, Telangana, India.",
+            "CEO: Ananya Rao.",
+            "FY 2025-26 revenue: INR 18.4 crore.",
+        ):
+            profile.new_page().insert_text((72, 72), f"Novatek facts. {fact}")
+        raw = profile.tobytes()
+    conversation = create_conversation(client, auth)
+    uploaded = client.post(conversation + "/attachments", headers=auth, data={"files": [
+        (io.BytesIO(raw), "sample_company_profile_novatek.pdf"),
+        (pdf("Orchard facts. Founded: 2021."), "orchard.pdf"),
+    ]}).json
+    novatek, orchard = [doc["id"] for doc in uploaded]
+    assert document_jobs.process_next() and document_jobs.process_next()
+    assert db.session.get(Document, novatek).status == "ready"
+    assert DocumentChunk.query.filter_by(document_id=novatek).count() == 3
+
+    scenarios = [
+        ("When was Novatek Systems founded?", "When was it established?", novatek, "2018", 1),
+        ("Where is its headquarters?", "Novatek headquarters", novatek, "Hyderabad, Telangana, India", 1),
+        ("Who is the CEO?", "CEO", novatek, "Ananya Rao", 2),
+        ("What was its FY 2025-26 revenue?", "FY 2025-26 revenue", novatek, "INR 18.4 crore", 3),
+        ("Who is its chairperson?", "Novatek chairperson", novatek, None, None),
+        ("When was Orchard founded?", "Orchard founded", orchard, "2021", 1),
+    ]
+    for question, rewritten, doc_id, value, page in scenarios:
+        def completion(system, messages, **_):
+            if system.startswith("Classify"):
+                return json.dumps({"mode": "document", "query": rewritten, "document_ids": [doc_id]})
+            passages = json.loads(messages[-1]["content"])["passages"]
+            assert {passage["document_id"] for passage in passages} == {doc_id}
+            evidence = next((p for p in passages if value and value in p["text"]), None)
+            assert evidence is not None
+            return json.dumps({"document_answer": f"{value} [Source {evidence['index']}]."})
+
+        monkeypatch.setattr(groq_chat, "complete", completion)
+        answer = ask(client, auth, question, conversation).json["answer"]
+        if value is None:
+            assert answer["content"] == MISSING and not answer["sources"]
+        else:
+            assert value in answer["content"]
+            assert (answer["sources"][0]["document_id"], answer["sources"][0]["page_number"]) == (doc_id, page)
+    other = client.post("/api/auth/register", json={
+        "name": "Other", "email": "other-owner@example.com", "password": "other-password",
+    }).json
+    other_auth = {"Authorization": "Bearer " + other["access_token"]}
+    assert client.get(f"/api/documents/{novatek}/pdf", headers=other_auth).status_code == 404
+    assert not vectors.retrieve(other["user"]["id"], "Novatek founded", document_ids=[novatek])
+
+
 def test_general_and_python_follow_up(client, auth, monkeypatch):
     calls = mock_groq(monkeypatch, {"mode": "general"}, "A stack uses last-in, first-out order.",
                       {"mode": "general"}, "```python\nstack = []\n```")

@@ -97,6 +97,11 @@ def embed_chunks(chunks):
             raise RuntimeError("The embedding service returned incomplete results. Retry this document.")
         vectors.extend(embedded)
     by_text = dict(zip(texts, vectors))
+    if vectors and (not len(vectors[0]) or any(
+        len(vector) != len(vectors[0]) or not np.isfinite(vector).all() or not np.any(vector)
+        for vector in vectors
+    )):
+        raise RuntimeError("The embedding service returned invalid vectors. Retry this document.")
     return [by_text[chunk["text"]] for chunk in chunks]
 
 
@@ -136,9 +141,10 @@ def delete_document(document_id):
         client.get_collection(name).delete(where={"document_id": document_id})
 
 
-def retrieve(user_id, question, limit=6, *, document_ids=None, max_distance=0.55, across_documents=False):
+def retrieve(user_id, question, limit=6, *, document_ids=None, max_distance=0.55, across_documents=False,
+             original_question=None):
     try:
-        return _retrieve(user_id, question, limit, document_ids, max_distance, across_documents)
+        return _retrieve(user_id, question, limit, document_ids, max_distance, across_documents, original_question)
     except RuntimeError:
         raise
     except Exception:
@@ -146,21 +152,25 @@ def retrieve(user_id, question, limit=6, *, document_ids=None, max_distance=0.55
         raise RuntimeError("Document search is unavailable. Please retry.") from None
 
 
-def _retrieve(user_id, question, limit, document_ids, max_distance, across_documents):
+def _retrieve(user_id, question, limit, document_ids, max_distance, across_documents, original_question):
     if current_app.config["DOCUMENT_JOBS"]:
         indexed, legacy = _document_ids(user_id, document_ids)
+        current_app.logger.info("PDF index filter user=%s stored=%s legacy=%s model=%s",
+                                user_id, indexed, legacy, _model_name())
         if not indexed:
             return _retrieve_legacy(user_id, question, limit, legacy, max_distance, across_documents)
-        query = np.asarray(embed([question])[0], dtype="<f4")
+        questions = list(dict.fromkeys([question, original_question or question]))
+        queries = [_unit_vector(vector) for vector in embed(questions)]
+        terms = _search_terms(questions)
         groups = [[doc_id] for doc_id in (indexed + legacy)[:10]] if across_documents else [indexed + legacy]
         rows = []
         for group in groups:
             group_limit = 2 if len(groups) > 1 else limit
-            hits = _stored_hits(query, user_id, [doc for doc in group if doc in indexed], group_limit, max_distance)
+            hits = _stored_hits(queries, terms, user_id, [doc for doc in group if doc in indexed], group_limit, max_distance)
             legacy_group = [doc for doc in group if doc in legacy]
             if legacy_group:
-                hits += _retrieve_legacy(user_id, question, group_limit, legacy_group, max_distance, False, [query.tolist()])
-            rows.extend(nsmallest(group_limit, hits, key=lambda hit: hit["distance"]))
+                hits += _retrieve_legacy(user_id, question, group_limit, legacy_group, max_distance, False, [queries[0].tolist()])
+            rows.extend(nsmallest(group_limit, hits, key=lambda hit: hit.get("rank", hit["distance"])))
         return rows
     return _retrieve_legacy(user_id, question, limit, document_ids, max_distance, across_documents)
 
@@ -176,32 +186,49 @@ def _document_ids(user_id, document_ids):
     return indexed, legacy
 
 
-def _stored_hits(query, user_id, document_ids, limit, max_distance):
+_STOP_WORDS = set("when where what which who why how was were is are its the and does did has have from for about according document pdf".split())
+
+
+def _search_terms(texts):
+    return {word for text in texts for word in re.findall(r"\b\w{3,}\b", text.casefold())
+            if word not in _STOP_WORDS}
+
+
+def _stored_hits(queries, terms, user_id, document_ids, limit, max_distance):
     if not document_ids:
         return []
-    statement = select(DocumentChunk.document_id, DocumentChunk.position, DocumentChunk.embedding).join(Document).where(
+    statement = select(DocumentChunk.document_id, DocumentChunk.position, DocumentChunk.embedding,
+                       DocumentChunk.content).join(Document).where(
         Document.user_id == user_id, Document.status == "ready",
         Document.id.in_(document_ids), DocumentChunk.model == _model_name(),
     ).execution_options(yield_per=128)
-    query = _unit_vector(query)
-    if not query.any():
-        return []
+    query = queries[0]
+    query_matrix = np.stack(queries)
+    scanned = compatible = 0
 
     def matches():
+        nonlocal scanned, compatible
         for batch in db.session.execute(statement).partitions():
-            embeddings = [(document_id, position, np.frombuffer(raw, dtype="<f4"))
-                          for document_id, position, raw in batch if len(raw) == query.nbytes]
+            scanned += len(batch)
+            embeddings = [(document_id, position, np.frombuffer(raw, dtype="<f4"), content)
+                          for document_id, position, raw, content in batch if len(raw) == query.nbytes]
             if not embeddings:
                 continue
-            distances = 1 - np.clip(np.stack([row[2] for row in embeddings]) @ query, -1, 1)
-            for (document_id, position, embedding), distance in zip(embeddings, distances):
-                if distance <= max_distance and embedding.any():
-                    yield float(distance), document_id, position
+            compatible += len(embeddings)
+            similarities = np.stack([row[2] for row in embeddings]) @ query_matrix.T
+            distances = 1 - np.clip(similarities.max(axis=1), -1, 1)
+            for (document_id, position, embedding, content), distance in zip(embeddings, distances):
+                overlap = len(terms & _search_terms([content]))
+                keyword_score = overlap / max(1, len(terms))
+                if embedding.any() and (distance <= max_distance or overlap >= 2 or keyword_score == 1):
+                    yield float(distance) - 0.30 * keyword_score, document_id, position, float(distance), keyword_score
 
     selected = nsmallest(limit, matches())
+    current_app.logger.info("PDF index scan documents=%s chunks=%s compatible=%s query_dimensions=%s",
+                            document_ids, scanned, compatible, query.size)
     if not selected:
         return []
-    keys = [(document_id, position) for _, document_id, position in selected]
+    keys = [(document_id, position) for _, document_id, position, _, _ in selected]
     passages = {
         (document_id, position): {"text": content, "metadata": {
             "document_id": document_id, "document_name": name, "page_number": page_number,
@@ -214,7 +241,8 @@ def _stored_hits(query, user_id, document_ids, limit, max_distance):
             tuple_(DocumentChunk.document_id, DocumentChunk.position).in_(keys),
         ))
     }
-    return [{**passages[key], "distance": hit[0]} for hit, key in zip(selected, keys) if key in passages]
+    return [{**passages[key], "rank": hit[0], "distance": hit[3], "keyword_score": hit[4]}
+            for hit, key in zip(selected, keys) if key in passages]
 
 
 def _stored_passage(chunk, name):
