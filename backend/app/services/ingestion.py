@@ -56,24 +56,34 @@ def ingest(file, user_id, *, pdf_only=False):
     # Serialize ingestion for this owner so duplicate requests reuse the completed document.
     User.query.filter_by(id=user_id).with_for_update().one()
     existing = Document.query.filter_by(user_id=user_id, content_hash=digest).first()
+    upload_root = Path(current_app.config["UPLOAD_FOLDER"])
     if existing:
         if existing.file_type != extension[1:]:
             raise ValueError("These bytes were previously uploaded with a different file type.")
+        path = upload_root / existing.stored_name
+        if path.is_file() and existing.status == "ready":
+            return existing
+        if not path.is_file():
+            save_upload(file, path)
+        process_document(existing, retry=True)
         return existing
 
     stored = f"{uuid4().hex}{extension}"
-    folder = Path(current_app.config["UPLOAD_FOLDER"]) / str(user_id)
-    path = folder / stored
-    try:
-        folder.mkdir(parents=True, exist_ok=True)
-        file.save(path)
-        size = path.stat().st_size
-    except OSError:
-        path.unlink(missing_ok=True)
-        raise ValueError("The server could not store this file. Please retry.") from None
+    path = upload_root / str(user_id) / stored
+    size = save_upload(file, path)
     document = Document(user_id=user_id, original_name=name[:255], stored_name=f"{user_id}/{stored}",
                         file_type=extension[1:], file_size=size, content_hash=digest, status="processing")
     db.session.add(document)
     db.session.flush()
     process_document(document)
     return document
+
+
+def save_upload(file, path):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        file.save(path)
+        return path.stat().st_size
+    except OSError:
+        path.unlink(missing_ok=True)
+        raise ValueError("The server could not store this file. Please retry.") from None

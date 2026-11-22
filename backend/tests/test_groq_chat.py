@@ -1,5 +1,6 @@
 import io
 import json
+from pathlib import Path
 
 import httpx
 import pymupdf
@@ -7,6 +8,7 @@ import pytest
 from groq import Groq
 
 from app.services import groq_chat, vectors
+from app.models import Document
 from app.services.chat import MISSING
 
 
@@ -120,6 +122,27 @@ def test_invalid_and_oversized_pdf(client, auth, app):
     app.config["MAX_PDF_PAGES"] = 1
     too_many_pages = client.post(attachments, headers=auth, data={"files": (pdf("page two", 2), "large.pdf")})
     assert "1-page limit" in too_many_pages.json[0]["error"]
+
+
+def test_reupload_restores_lost_pdf_and_summary(app, client, auth, monkeypatch):
+    chat = create_conversation(client, auth)
+    original = pdf("Kestrel uses a PostgreSQL database.").getvalue()
+    upload = client.post(chat + "/attachments", headers=auth,
+                         data={"files": (io.BytesIO(original), "Kestrel.pdf")})
+    document_id = upload.json[0]["id"]
+    document = Document.query.filter_by(id=document_id).one()
+    (Path(app.config["UPLOAD_FOLDER"]) / document.stored_name).unlink()
+    vectors.delete_document(document_id)
+
+    restored = client.post(chat + "/attachments", headers=auth,
+                           data={"files": (io.BytesIO(original), "Kestrel.pdf")})
+    assert restored.json[0]["id"] == document_id
+    assert restored.json[0]["status"] == "ready"
+    assert len(client.get(chat, headers=auth).json["attachments"]) == 1
+    mock_groq(monkeypatch, {"mode": "document", "overview": True},
+              {"document_answer": "Kestrel uses PostgreSQL [Source 1]."})
+    answer = ask(client, auth, "Summarize the PDF.", chat).json["answer"]
+    assert answer["sources"][0]["document_id"] == document_id
 
 
 def test_attachments_are_reused_and_scoped_to_conversation(client, auth, monkeypatch):
