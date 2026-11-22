@@ -57,6 +57,8 @@ Backend: from `backend/`, run `pytest`. Tests use in-memory SQLite and mocks for
 
 `render.yaml` provisions a Docker web service, persistent disk, and private Postgres database. The container serves the frontend and API on the same origin and applies migrations at startup. Set `GROQ_API_KEY` in Render when applying the Blueprint. The Render deployment starts with an empty database and disk. Local MySQL, files, and conversations remain local unless migrated separately.
 
+`render-free.yaml` deploys a free demo using a single web service. It stores its SQLite database, uploaded files, and vector index on the instance's temporary filesystem. Render resets those files when the instance spins down, restarts, or redeploys.
+
 For separate frontend and backend services, use the manual setup below.
 
 1. Link the Paperwise Git repository to a Render Python web service. Use `backend/` as the root directory and `python -m pip install -r requirements.txt` as the build command.
