@@ -26,8 +26,20 @@ class User(db.Model):
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
 
+    def account_created_at(self):
+        created_at = self.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        return created_at.astimezone(timezone.utc).isoformat()
+
     def to_dict(self):
         return {"id": self.id, "name": self.name, "email": self.email}
+
+
+class RevokedToken(db.Model):
+    __tablename__ = "revoked_tokens"
+    jti = db.Column(db.String(36), primary_key=True)
+    expires_at = db.Column(db.DateTime(timezone=True), nullable=False, index=True)
 
 
 class Document(db.Model):

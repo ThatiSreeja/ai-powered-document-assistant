@@ -1,8 +1,13 @@
+from datetime import datetime, timezone
 from pathlib import Path
 from flask import Blueprint, current_app, jsonify, request, send_file
-from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required
+from flask_jwt_extended import (
+    create_access_token, get_csrf_token, get_jwt, get_jwt_identity, jwt_required,
+    set_access_cookies, unset_jwt_cookies,
+)
+from sqlalchemy.exc import IntegrityError
 from app.extensions import db
-from app.models import Conversation, Document, Message, User, utcnow
+from app.models import Conversation, Document, Message, RevokedToken, User, utcnow
 from app.services.documents import extract_pages
 from app.services.ingestion import ingest, process_document
 from app.services.rag import answer_question, summarize
@@ -28,19 +33,38 @@ def owned_document(document_id, user_id, *, lock=False):
     return (query.with_for_update() if lock else query).first()
 
 
+def auth_response(user, status=200):
+    token = create_access_token(
+        identity=str(user.id), additional_claims={"account_created_at": user.account_created_at()},
+    )
+    if request.headers.get("X-Paperwise-Session") == "cookie":
+        response = jsonify({"user": user.to_dict(), "csrf_token": get_csrf_token(token)})
+        set_access_cookies(response, token)
+    else:
+        response = jsonify({"user": user.to_dict(), "access_token": token})
+    response.headers["Cache-Control"] = "no-store"
+    return response, status
+
+
 @api.post("/auth/register")
 def register():
     data = request.get_json(silent=True) or {}
     name, email, password = (data.get("name", "").strip(), data.get("email", "").strip().lower(), data.get("password", ""))
-    if not name or len(name) > 120 or "@" not in email or len(password) < 8:
+    if not name or len(name) > 120 or len(email) > 255 or "@" not in email or len(password) < 8:
         return error("Provide a name, valid email and password of at least 8 characters.")
     if User.query.filter_by(email=email).first():
         return error("An account with this email already exists.", 409)
     user = User(name=name, email=email)
     user.set_password(password)
     db.session.add(user)
-    db.session.commit()
-    return jsonify({"access_token": create_access_token(identity=str(user.id)), "user": user.to_dict()}), 201
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        if User.query.filter_by(email=email).first():
+            return error("An account with this email already exists.", 409)
+        raise
+    return auth_response(user, 201)
 
 
 @api.post("/auth/login")
@@ -49,20 +73,40 @@ def login():
     user = User.query.filter_by(email=data.get("email", "").strip().lower()).first()
     if not user or not user.check_password(data.get("password", "")):
         return error("Email or password is incorrect.", 401)
-    return jsonify({"access_token": create_access_token(identity=str(user.id)), "user": user.to_dict()})
+    return auth_response(user)
 
 
 @api.post("/auth/logout")
 @jwt_required()
 def logout():
-    return jsonify({"message": "Logged out. Remove the access token from this device."})
+    claims = get_jwt()
+    RevokedToken.query.filter(RevokedToken.expires_at <= utcnow()).delete()
+    db.session.add(RevokedToken(
+        jti=claims["jti"], expires_at=datetime.fromtimestamp(claims["exp"], timezone.utc),
+    ))
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        if db.session.get(RevokedToken, claims["jti"]) is None:
+            raise
+    response = jsonify({"message": "Logged out."})
+    unset_jwt_cookies(response)
+    return response
 
 
 @api.get("/auth/me")
 @jwt_required()
 def me():
     user = db.session.get(User, int(get_jwt_identity()))
-    return jsonify(user.to_dict()) if user else error("User not found.", 404)
+    if user is None:
+        return error("User not found.", 404)
+    profile = user.to_dict()
+    if request.headers.get("X-Paperwise-Session") == "cookie":
+        profile["csrf_token"] = get_jwt().get("csrf")
+    response = jsonify(profile)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @api.route("/documents", methods=["GET", "POST"])

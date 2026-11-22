@@ -1,21 +1,44 @@
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def database_url(value):
+    for scheme in ("postgres://", "postgresql://"):
+        if value.startswith(scheme):
+            return "postgresql+psycopg2://" + value[len(scheme):]
+    return value
+
+
+def cors_origins(value):
+    origins = [origin.strip().rstrip("/") for origin in value.split(",") if origin.strip()]
+    for origin in origins:
+        parsed = urlsplit(origin)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or any((parsed.path, parsed.query, parsed.fragment, parsed.username, parsed.password))
+                or "*" in origin):
+            raise ValueError("CORS_ORIGINS must contain explicit HTTP or HTTPS origins")
+    return origins
 
 
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "dev-only-change-this-secret")
     JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-only-change-this-jwt-secret")
-    SQLALCHEMY_DATABASE_URI = os.getenv(
+    SQLALCHEMY_DATABASE_URI = database_url(os.getenv(
         "DATABASE_URL",
         "mysql+pymysql://root:password@localhost:3306/document_assistant?charset=utf8mb4",
-    )
-    if SQLALCHEMY_DATABASE_URI.startswith("postgres://"):
-        SQLALCHEMY_DATABASE_URI = SQLALCHEMY_DATABASE_URI.replace("postgres://", "postgresql://", 1)
+    ))
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    SQLALCHEMY_ENGINE_OPTIONS = {"pool_pre_ping": True, "hide_parameters": True}
     FRONTEND_DIST = os.getenv("FRONTEND_DIST")
     JWT_ACCESS_TOKEN_EXPIRES = 3600
+    JWT_TOKEN_LOCATION = ["headers", "cookies"]
+    JWT_ACCESS_COOKIE_PATH = "/api"
+    JWT_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", os.getenv("RENDER", "false")).lower() == "true"
+    JWT_COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "Lax")
+    JWT_CSRF_IN_COOKIES = False
     MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH", 16 * 1024 * 1024))
     UPLOAD_FOLDER = str(BASE_DIR / os.getenv("UPLOAD_FOLDER", "uploads"))
     CHROMA_PATH = str(BASE_DIR / os.getenv("CHROMA_PATH", "vector_store"))
@@ -33,5 +56,5 @@ class Config:
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
     OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "qwen2.5:3b")
     OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
-    CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+    CORS_ORIGINS = cors_origins(os.getenv("CORS_ORIGINS", "http://localhost:5173"))
     RATELIMIT_STORAGE_URI = os.getenv("RATELIMIT_STORAGE_URI", "memory://")

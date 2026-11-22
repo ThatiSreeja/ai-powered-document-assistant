@@ -1,7 +1,16 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import App from './App'
+
+vi.mock('./services/api', () => ({
+  default: {
+    get: vi.fn().mockRejectedValue({ response: { status: 401 } }),
+    interceptors: { response: { use: vi.fn(), eject: vi.fn() } },
+  },
+  sessionHeaders: {},
+  setCsrfToken: vi.fn(),
+}))
 
 afterEach(() => { cleanup(); localStorage.clear() })
 
@@ -12,8 +21,8 @@ describe('Paperwise entry experience', () => {
     expect(screen.getByRole('link', { name: /Get started for free/i })).toBeTruthy()
   })
 
-  it('protects workspace routes when signed out', () => {
+  it('protects workspace routes when signed out', async () => {
     render(<MemoryRouter initialEntries={['/app']}><App /></MemoryRouter>)
-    expect(screen.getByText(/Sign in to Paperwise/i)).toBeTruthy()
+    expect(await screen.findByText(/Sign in to Paperwise/i)).toBeTruthy()
   })
 })

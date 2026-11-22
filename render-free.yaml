@@ -1,4 +1,4 @@
-# Free demo. Local data is reset when Render stops or replaces the instance.
+# Free web service with an externally provisioned PostgreSQL database.
 services:
   - type: web
     name: paperwise-demo
@@ -8,7 +8,7 @@ services:
     healthCheckPath: /api/health
     envVars:
       - key: DATABASE_URL
-        value: sqlite:////tmp/paperwise/paperwise.db
+        sync: false
       - key: SECRET_KEY
         generateValue: true
       - key: JWT_SECRET_KEY

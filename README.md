@@ -14,7 +14,7 @@ Paperwise answers general questions with Groq and retrieves passages from your P
 
 ## Stack and layout
 
-React 18, JavaScript, Vite, Tailwind CSS, React Router, Axios, Flask, SQLAlchemy, Flask-Migrate, JWT, MySQL 8, ChromaDB and the Groq Python SDK. See [architecture](docs/architecture.md), [database design](docs/database_design.md), [API docs](docs/api_documentation.md), and [RAG pipeline](docs/rag_pipeline.md).
+React 18, JavaScript, Vite, Tailwind CSS, React Router, Axios, Flask, SQLAlchemy, Flask-Migrate, JWT, PostgreSQL, ChromaDB and the Groq Python SDK. Existing local MySQL 8 deployments are also supported. See [architecture](docs/architecture.md), [database design](docs/database_design.md), [API docs](docs/api_documentation.md), and [RAG pipeline](docs/rag_pipeline.md).
 
 ```text
 backend/app/{models,routes,services}/  Flask API and RAG services
@@ -27,14 +27,14 @@ docs/                                  Architecture and API notes
 
 - Python 3.11 or newer
 - Node.js 20 or newer with npm
-- MySQL 8 running locally or remotely
+- PostgreSQL running locally or remotely, or an existing MySQL 8 database
 - A [Groq API key](https://console.groq.com/keys)
 - Network access to download the local MiniLM embedding model on first use
 
 ## Local setup
 
 1. Copy `backend/.env.example` to `backend/.env` if needed. Set `GROQ_API_KEY`, `SECRET_KEY`, `JWT_SECRET_KEY`, and `DATABASE_URL` in the backend file. Keep it private.
-2. Create the application database using `database/schema.sql`, or point `DATABASE_URL` to an existing MySQL 8 database.
+2. Create an empty PostgreSQL database and point `DATABASE_URL` to it. If you use MySQL 8 locally, create its database using `database/schema.sql` or use your existing database URL.
 3. From `backend/`, create a virtual environment and run `python -m pip install -r requirements.txt`. Apply migrations with `python -m flask --app run db upgrade`.
 4. From `backend/`, start the API with `python run.py`. It listens at `http://localhost:5000`.
 5. From `frontend/`, run `npm ci` and `npm run dev`. Open `http://localhost:5173`.
@@ -55,14 +55,20 @@ Backend: from `backend/`, run `pytest`. Tests use in-memory SQLite and mocks for
 
 ## Deployment preparation
 
-`render.yaml` provisions a Docker web service, persistent disk, and private Postgres database. The container serves the frontend and API on the same origin and applies migrations at startup. Set `GROQ_API_KEY` in Render when applying the Blueprint. The Render deployment starts with an empty database and disk. Local MySQL, files, and conversations remain local unless migrated separately.
+`render.yaml` provisions a Docker web service, a persistent disk for PDFs and Chroma, and a private PostgreSQL database in Oregon. The Blueprint supplies the internal connection string as `DATABASE_URL`. Set `GROQ_API_KEY` in Render and keep the generated `SECRET_KEY` and `JWT_SECRET_KEY` stable. The container serves the frontend and API on the same origin and runs `python -m flask --app run db upgrade` before starting Gunicorn. A newly provisioned database and disk start empty.
 
-`render-free.yaml` deploys a free demo using a single web service. It stores its SQLite database, uploaded files, and vector index on the instance's temporary filesystem. Render resets those files when the instance spins down, restarts, or redeploys.
+`render-free.yaml` deploys a free web service. Set `DATABASE_URL` to a persistent PostgreSQL connection string to retain accounts across restarts and redeploys. When upgrading a demo that used SQLite, migrate any surviving account data before switching databases if you need to preserve existing sign-ins. Uploaded files and the vector index still use the instance's temporary filesystem and reset when Render spins down, restarts, or redeploys the service.
+
+To keep an existing Render URL, upgrade that web service to a plan that supports persistent disks and attach a disk at `/var/data`. Create a dedicated PostgreSQL database in the service's region and use its **Internal Database URL** for the backend's `DATABASE_URL`. Use the storage paths in `render.yaml`. Before changing settings that can restart an existing service, back up any available SQLite database, uploaded files, and Chroma directory. Preserving existing sign-ins requires importing their original account rows and password hashes along with any related application records before switching traffic. A new PostgreSQL database cannot recover files or accounts already lost from ephemeral storage.
+
+The relational schema contains `users`, `documents`, `document_processing_logs`, `conversations`, `messages`, `conversation_documents`, and `revoked_tokens`, plus Alembic's `alembic_version`. To exercise restart and migration tests against PostgreSQL, set `PAPERWISE_TEST_POSTGRES_URL` to a test database whose user can create schemas, then run `python -m pytest` from `backend/`.
+
+Browser sign-in uses an HTTP-only session cookie with a one-hour token lifetime and CSRF protection. Paperwise restores an active session when a page reloads. Signing out revokes that session in PostgreSQL. On the first visit after upgrading from browser-stored tokens, sign in once using your existing email and password.
 
 For separate frontend and backend services, use the manual setup below.
 
 1. Link the Paperwise Git repository to a Render Python web service. Use `backend/` as the root directory and `python -m pip install -r requirements.txt` as the build command.
-2. Set `GROQ_API_KEY`, `SECRET_KEY`, `JWT_SECRET_KEY`, and `DATABASE_URL` in the backend service's Environment settings. Point `DATABASE_URL` to a persistent MySQL database and set `CORS_ORIGINS` to the frontend origin.
+2. Set `GROQ_API_KEY`, `SECRET_KEY`, `JWT_SECRET_KEY`, and `DATABASE_URL` in the backend service's Environment settings. Use the persistent PostgreSQL internal URL when the services share a region. Set `CORS_ORIGINS` to the exact HTTPS frontend origin. Set `AUTH_COOKIE_SECURE=true`. If the frontend and backend are on different sites, set `AUTH_COOKIE_SAMESITE=None`. Browsers that block third-party cookies can require a same-site domain or same-origin hosting.
 3. Attach a persistent disk to the backend at `/var/data`. Set `UPLOAD_FOLDER=/var/data/uploads`, `CHROMA_PATH=/var/data/chroma`, and `EMBEDDING_CACHE_PATH=/var/data/models`. Keep the uploads and Chroma paths from the current deployment if it already has indexed files. [Render persistent disks](https://render.com/docs/disks)
 4. Use `python -m flask --app run db upgrade && gunicorn --workers 1 --threads 4 --timeout 180 --bind 0.0.0.0:$PORT run:app` as the start command. A single worker process shares the embedded Chroma client across its threads. Set the health check path to `/api/health`.
 5. Use `frontend/` as the root directory for the static site. Build with `npm ci --include=dev && npm run build`, publish `dist`, set `VITE_API_URL` to the backend HTTPS URL ending in `/api`, and configure a rewrite from `/*` to `/index.html`.
@@ -70,4 +76,4 @@ For separate frontend and backend services, use the manual setup below.
 
 ## Learning the RAG flow
 
-Think of the vector database as a meaning-based index. The app converts every small document passage into a vector when you upload it. Your question is converted the same way. ChromaDB finds passages close in meaning and returns only the signed-in user's matches. The language model sees those passages and your question, then writes an answer with source labels. MySQL keeps accounts, documents, chat messages and source references; it does not hold vectors.
+Think of the vector database as a meaning-based index. The app converts every small document passage into a vector when you upload it. Your question is converted the same way. ChromaDB finds passages close in meaning and returns only the signed-in user's matches. The language model sees those passages and your question, then writes an answer with source labels. The relational database keeps accounts, document metadata, chat messages, and source references. ChromaDB keeps the embeddings on disk.

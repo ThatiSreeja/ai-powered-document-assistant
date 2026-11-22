@@ -2,13 +2,13 @@ import { createContext, useContext, useEffect, useState } from 'react'
 import { Link, Navigate, NavLink, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { Activity, ArrowUpRight, FileText, FolderOpen, LayoutDashboard, LogOut, MessageSquare, Plus, Search, Send, Settings, ShieldCheck, Sparkles, Trash2, UploadCloud, BookOpen, RefreshCw } from 'lucide-react'
 import Chat from './Chat'
-import api from './services/api'
+import api, { sessionHeaders, setCsrfToken } from './services/api'
 
 const Auth = createContext(null)
 const useAuth = () => useContext(Auth)
-function Protected({ children }) { const { token } = useAuth(); return token ? children : <Navigate to="/login" replace /> }
+function Protected({ children }) { const { user } = useAuth(); return user ? children : <Navigate to="/login" replace /> }
 function Shell({ children }) {
-  const { user, logout } = useAuth()
+  const { user, logout, logoutError } = useAuth()
   const links = [["Overview", "/app", LayoutDashboard], ["Documents", "/app/documents", FolderOpen], ["AI chat", "/app/chat", MessageSquare], ["Summaries", "/app/summaries", BookOpen], ["History", "/app/history", Activity], ["Settings", "/app/settings", Settings]]
   const { pathname } = useLocation()
   const current = links.find(([, path]) => path === pathname)
@@ -31,6 +31,7 @@ function Shell({ children }) {
       <div className="sidebar-bottom">
         <div className="secure-note"><ShieldCheck size={16}/><span><b>Your files stay yours</b><small>Private and securely indexed</small></span></div>
         <div className="profile-chip"><div className="avatar">{user?.name?.[0]?.toUpperCase() || 'U'}</div><span><b>{user?.name || 'Account'}</b><small>{user?.email || ''}</small></span></div>
+        {logoutError && <p role="alert">{logoutError}</p>}
         <button className="nav-item logout" onClick={logout} title="Sign out"><LogOut size={17}/><span>Sign out</span></button>
       </div>
     </aside>
@@ -85,4 +86,75 @@ function AuthPage({mode}){const [name,setName]=useState(''),[email,setEmail]=use
 function Landing(){return <div className="landing"><nav className="landing-nav"><Link className="brand" to="/"><span className="brand-mark"><Sparkles size={19}/></span><span>paperwise<span className="brand-dot">.</span><small>DOCUMENT INTELLIGENCE</small></span></Link><div><Link to="/login" className="landing-login">Sign in</Link><Link to="/register" className="button primary">Get started <ArrowUpRight size={15}/></Link></div></nav><section className="hero"><div className="hero-copy"><div className="hero-tag"><span/> YOUR DOCUMENTS, IN CONVERSATION</div><h1>Good answers<br/>start <em>with context.</em></h1><p>Bring your documents together and ask what matters. Get clear answers grounded in your own files, with sources you can follow.</p><div className="hero-actions"><Link className="button primary large-button" to="/register">Get started for free <ArrowUpRight size={16}/></Link><span>No credit card required</span></div><div className="hero-trust"><ShieldCheck size={15}/> Private by design <i/> Source-backed answers <i/> Your files stay yours</div></div><div className="hero-art"><div className="ambient ambient-one"/><div className="ambient ambient-two"/><div className="mock-window"><div className="mock-head"><div className="mock-dots"><i/><i/><i/></div><span>paperwise / your workspace</span><Sparkles size={15}/></div><div className="mock-sidebar"><div className="mock-nav active"><LayoutDashboard size={13}/> Overview</div><div className="mock-nav"><FolderOpen size={13}/> Documents</div><div className="mock-nav"><MessageSquare size={13}/> AI chat</div><div className="mock-mini-label">YOUR LIBRARY</div><div className="mock-file"><span className="mini-pdf">PDF</span><span>Q3 strategy brief</span></div><div className="mock-file"><span className="mini-doc">DOC</span><span>Customer interviews</span></div><div className="mock-file"><span className="mini-txt">TXT</span><span>Launch notes</span></div></div><div className="mock-content"><div className="mock-welcome">Your knowledge, ready.</div><div className="mock-metrics"><div><small>DOCUMENTS</small><b>12</b></div><div><small>READY TO CHAT</small><b>10</b></div></div><div className="mock-chat"><div className="mock-avatar"><Sparkles size={12}/></div><div><small>YOUR QUESTION</small><p>What are our key priorities for Q3?</p></div></div><div className="mock-answer"><div className="mock-answer-label"><Sparkles size={13}/> PAPERWISE <span>· grounded in 3 sources</span></div><p>Based on your strategy brief, the main priorities are improving customer retention, expanding the self-service experience, and reducing onboarding time.</p><div className="mock-source"><FileText size={12}/> Q3 strategy brief <span>p. 4</span></div></div><div className="mock-input">Ask a question about your documents… <span><Send size={12}/></span></div></div></div><div className="float-card float-source"><span className="float-icon"><FileText size={15}/></span><span><b>Source found</b><small>Q3 strategy brief · p. 4</small></span><span className="float-check">✓</span></div><div className="float-card float-private"><ShieldCheck size={15}/><span>Your files stay yours</span></div></div></section><section className="landing-bottom"><div><span className="bottom-mark">01</span><span><b>Bring your files</b><small>PDF, Word, and plain text.</small></span></div><div><span className="bottom-mark">02</span><span><b>Ask in plain language</b><small>No searching page by page.</small></span></div><div><span className="bottom-mark">03</span><span><b>Check every source</b><small>Answers point back to your files.</small></span></div><span className="landing-footnote">MADE FOR THINKING CLEARLY</span></section></div>}
 
 function SPARKLE_LABEL(){return <Sparkles size={12}/>}
-export default function App(){const [token,setToken]=useState(localStorage.getItem('access_token'));const [user,setUser]=useState(null);useEffect(()=>{if(token)api.get('/auth/me').then(r=>setUser(r.data)).catch(()=>{localStorage.removeItem('access_token');setToken(null)})},[token]);async function login(path,body){const {data}=await api.post(path,body);localStorage.setItem('access_token',data.access_token);setToken(data.access_token);setUser(data.user)}function logout(){api.post('/auth/logout').catch(()=>{});localStorage.removeItem('access_token');setToken(null);setUser(null)}return <Auth.Provider value={{token,user,login,logout}}><Routes><Route path="/" element={token?<Navigate to="/app"/>:<Landing/>}/><Route path="/login" element={token?<Navigate to="/app"/>:<AuthPage mode="login"/>}/><Route path="/register" element={token?<Navigate to="/app"/>:<AuthPage mode="register"/>}/><Route path="/app" element={<Protected><Shell><Dashboard/></Shell></Protected>}/><Route path="/app/documents" element={<Protected><Shell><Documents/></Shell></Protected>}/><Route path="/app/chat" element={<Protected><Shell><Chat PageTitle={PageTitle} Empty={Empty}/></Shell></Protected>}/><Route path="/app/summaries" element={<Protected><Shell><Summaries/></Shell></Protected>}/><Route path="/app/history" element={<Protected><Shell><History/></Shell></Protected>}/><Route path="/app/settings" element={<Protected><Shell><SettingsPage/></Shell></Protected>}/><Route path="*" element={<Navigate to="/" replace/>}/></Routes></Auth.Provider>}
+export default function App() {
+  const [user, setUser] = useState(null)
+  const [checkingSession, setCheckingSession] = useState(true)
+  const [logoutError, setLogoutError] = useState('')
+  const { pathname } = useLocation()
+
+  useEffect(() => {
+    const controller = new AbortController()
+    localStorage.removeItem('access_token')
+    api.get('/auth/me', { headers: sessionHeaders, signal: controller.signal })
+      .then(({ data: { csrf_token, ...profile } }) => {
+        setCsrfToken(csrf_token)
+        setUser(profile)
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!controller.signal.aborted) setCheckingSession(false)
+      })
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    const id = api.interceptors.response.use(undefined, error => {
+      if (error.response?.status === 401 && !error.config?.url?.startsWith('/auth/')) {
+        setCsrfToken(null)
+        setUser(null)
+      }
+      return Promise.reject(error)
+    })
+    return () => api.interceptors.response.eject(id)
+  }, [])
+
+  async function login(path, body) {
+    const { data } = await api.post(path, body, { headers: sessionHeaders })
+    setCsrfToken(data.csrf_token)
+    setLogoutError('')
+    setUser(data.user)
+  }
+
+  async function logout() {
+    try {
+      await api.post('/auth/logout')
+    } catch (error) {
+      if (error.response?.status !== 401) {
+        setLogoutError('Could not sign out. Try again.')
+        return
+      }
+    }
+    setCsrfToken(null)
+    setUser(null)
+    setLogoutError('')
+  }
+
+  if (checkingSession && pathname !== '/') return <p role="status">Checking your session?</p>
+
+  return (
+    <Auth.Provider value={{ user, login, logout, logoutError }}>
+      <Routes>
+        <Route path="/" element={user ? <Navigate to="/app" /> : <Landing />} />
+        <Route path="/login" element={user ? <Navigate to="/app" /> : <AuthPage key="login" mode="login" />} />
+        <Route path="/register" element={user ? <Navigate to="/app" /> : <AuthPage key="register" mode="register" />} />
+        <Route path="/app" element={<Protected><Shell><Dashboard /></Shell></Protected>} />
+        <Route path="/app/documents" element={<Protected><Shell><Documents /></Shell></Protected>} />
+        <Route path="/app/chat" element={<Protected><Shell><Chat PageTitle={PageTitle} Empty={Empty} /></Shell></Protected>} />
+        <Route path="/app/summaries" element={<Protected><Shell><Summaries /></Shell></Protected>} />
+        <Route path="/app/history" element={<Protected><Shell><History /></Shell></Protected>} />
+        <Route path="/app/settings" element={<Protected><Shell><SettingsPage /></Shell></Protected>} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </Auth.Provider>
+  )
+}
