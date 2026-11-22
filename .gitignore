@@ -1,0 +1,15 @@
+.env
+*.env
+!.env.example
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+dist/
+backend/uploads/*
+!backend/uploads/.gitkeep
+backend/vector_store/*
+!backend/vector_store/.gitkeep
+backend/migrations/versions/*.pyc

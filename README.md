@@ -1,0 +1,67 @@
+# Paperwise — AI-Powered Document Assistant
+
+Paperwise answers general questions with Groq and retrieves passages from your PDF, DOCX and TXT files when a question calls for document evidence. It preserves conversation context, cites source files and pages, and can add general knowledge alongside a document answer.
+
+## Features
+
+- Password-hashed registration and JWT-protected API
+- User-scoped file library, processing status, filters and deletion
+- PDF page extraction, DOCX/TXT extraction, overlapping text chunks
+- Groq chat and local MiniLM embeddings with persistent ChromaDB
+- Source-cited RAG conversations, history, and document summaries API
+- Multi-PDF attachments in chat, with drag-and-drop, library reuse, and conversation-specific retrieval
+- Dashboard metrics, responsive React interface, rate limiting and health check
+
+## Stack and layout
+
+React 18, JavaScript, Vite, Tailwind CSS, React Router, Axios, Flask, SQLAlchemy, Flask-Migrate, JWT, MySQL 8, ChromaDB and the Groq Python SDK. See [architecture](docs/architecture.md), [database design](docs/database_design.md), [API docs](docs/api_documentation.md), and [RAG pipeline](docs/rag_pipeline.md).
+
+```text
+backend/app/{models,routes,services}/  Flask API and RAG services
+frontend/src/                          React user interface
+database/schema.sql                    MySQL database creation
+docs/                                  Architecture and API notes
+```
+
+## Prerequisites
+
+- Python 3.11 or newer
+- Node.js 20 or newer with npm
+- MySQL 8 running locally or remotely
+- A [Groq API key](https://console.groq.com/keys)
+- Network access to download the local MiniLM embedding model on first use
+
+## Local setup
+
+1. Copy `backend/.env.example` to `backend/.env` if needed. Set `GROQ_API_KEY`, `SECRET_KEY`, `JWT_SECRET_KEY`, and `DATABASE_URL` in the backend file. Keep it private.
+2. Create the application database using `database/schema.sql`, or point `DATABASE_URL` to an existing MySQL 8 database.
+3. From `backend/`, create a virtual environment and run `python -m pip install -r requirements.txt`. Apply migrations with `python -m flask --app run db upgrade`.
+4. From `backend/`, start the API with `python run.py`. It listens at `http://localhost:5000`.
+5. From `frontend/`, run `npm ci` and `npm run dev`. Open `http://localhost:5173`.
+
+Groq defaults to `openai/gpt-oss-120b`. Set `GROQ_CHAT_MODEL` to another Groq chat model that supports JSON object mode. `GROQ_TIMEOUT_SECONDS` is the per-request timeout. Groq receives the recent conversation and relevant excerpts for document questions. The embedding model runs in the backend process and uses `EMBEDDING_CACHE_PATH` when set.
+
+If you already indexed files with Ollama, set `EMBEDDING_PROVIDER=ollama` and retain the existing `OLLAMA_EMBEDDING_MODEL` and Chroma path to keep using those vectors with Groq chat. To switch the embedding model to MiniLM, reprocess the existing files from the document library. `AI_PROVIDER=ollama` and `AI_PROVIDER=openai` remain available for the previous document-chat behavior.
+
+## PDF attachments in chat
+
+Use the paperclip or drop PDFs onto the composer. You can attach existing PDFs from the inline library picker. A conversation accepts up to ten PDFs. Uploaded files, attachment links, and chat history persist across sign-ins. The remove button detaches the PDF from the conversation. The trash button permanently deletes it from the library, all conversations, and Chroma.
+
+Use `python -m flask --app run db upgrade` before running this version against an existing database. Previous conversations retain their messages and citations. Use the library picker to attach older PDFs to the appropriate conversation.
+
+## Tests
+
+Backend: from `backend/`, run `pytest`. Tests use in-memory SQLite and mocks for model calls; no API key or paid request is needed. Frontend: from `frontend/`, run `npm test`. Production build: `npm run build`.
+
+## Deployment preparation
+
+1. Link the Paperwise Git repository to a Render Python web service. Use `backend/` as the root directory and `python -m pip install -r requirements.txt` as the build command.
+2. Set `GROQ_API_KEY`, `SECRET_KEY`, `JWT_SECRET_KEY`, and `DATABASE_URL` in the backend service's Environment settings. Point `DATABASE_URL` to a persistent MySQL database and set `CORS_ORIGINS` to the frontend origin.
+3. Attach a persistent disk to the backend at `/var/data`. Set `UPLOAD_FOLDER=/var/data/uploads`, `CHROMA_PATH=/var/data/chroma`, and `EMBEDDING_CACHE_PATH=/var/data/models`. Keep the uploads and Chroma paths from the current deployment if it already has indexed files. [Render persistent disks](https://render.com/docs/disks)
+4. Use `python -m flask --app run db upgrade && gunicorn --workers 1 --threads 4 --timeout 180 --bind 0.0.0.0:$PORT run:app` as the start command. A single worker process shares the embedded Chroma client across its threads. Set the health check path to `/api/health`.
+5. Use `frontend/` as the root directory for the static site. Build with `npm ci --include=dev && npm run build`, publish `dist`, set `VITE_API_URL` to the backend HTTPS URL ending in `/api`, and configure a rewrite from `/*` to `/index.html`.
+6. Verify registration, general and document chat, sources, and deletion on the deployed site. Restart the backend and confirm that a previously uploaded file can still be queried.
+
+## Learning the RAG flow
+
+Think of the vector database as a meaning-based index. The app converts every small document passage into a vector when you upload it. Your question is converted the same way. ChromaDB finds passages close in meaning and returns only the signed-in user's matches. The language model sees those passages and your question, then writes an answer with source labels. MySQL keeps accounts, documents, chat messages and source references; it does not hold vectors.
