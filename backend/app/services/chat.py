@@ -16,6 +16,7 @@ GENERAL = (
     "Use history to resolve follow-ups. Ignore unrelated prior topics and never treat history as PDF evidence."
 )
 FILE_REFERENCE = re.compile(r"\b(?:pdfs?|attachments?|uploaded|attached|documents?|files?|summari[sz]e)\b", re.I)
+FILENAME_NOISE = {"sample", "company", "profile", "document", "documents", "file", "files", "pdf", "report"}
 
 
 def _json_completion(system, messages, max_tokens):
@@ -35,6 +36,18 @@ def available_documents(user_id, conversation_id):
         query = query.join(conversation_documents).join(Conversation).filter(
             Conversation.id == conversation_id, Conversation.user_id == user_id)
     return query.order_by(Document.id.desc()).all()
+
+
+def _filename_references(question, documents):
+    """Match distinctive filename words so a classifier cannot route an explicit file fact to general chat."""
+    question_words = set(re.findall(r"[a-z0-9]+", question.casefold()))
+    matches = []
+    for document in documents:
+        stem = document.original_name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].rsplit(".", 1)[0]
+        filename_words = set(re.findall(r"[a-z0-9]+", stem.casefold())) - FILENAME_NOISE
+        if filename_words & question_words:
+            matches.append(document)
+    return matches
 
 
 def answer(user_id, question, history, *, conversation_id=None):
@@ -92,11 +105,12 @@ def answer_stream(user_id, question, history, *, conversation_id=None, live=True
     requested = {value for value in requested if type(value) is int} if isinstance(requested, list) else set()
     if conversation_id is not None:
         requested &= {doc.id for doc in documents}
-    named = {doc.id for doc in documents if doc.original_name.casefold() in question.casefold()}
+    named = {doc.id for doc in _filename_references(question, documents)}
     if named:
         requested = named
         if mode in ("general", "automatic"):
             mode = "document"
+        current_app.logger.info("PDF filename reference user=%s selected=%s", user_id, sorted(named))
     selected = [doc for doc in documents if not requested or doc.id in requested]
     ready = [doc.id for doc in selected if doc.status == "ready"]
     waiting = [doc for doc in selected if doc.status in {"uploaded", "processing", "extracting", "embedding", "indexing"}]

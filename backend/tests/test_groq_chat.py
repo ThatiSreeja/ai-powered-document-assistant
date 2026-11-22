@@ -111,6 +111,30 @@ def pdf(text, page_number=1):
         return io.BytesIO(file.tobytes())
 
 
+def test_company_question_uses_pdf_when_classifier_calls_it_general(client, auth, monkeypatch):
+    conversation = create_conversation(client, auth)
+    upload = client.post(conversation + "/attachments", headers=auth, data={
+        "files": (pdf("NOVATEK SYSTEMS. Founded 2018."), "sample_company_profile_novatek.pdf"),
+    })
+    assert upload.status_code == 201
+    document_id = upload.json[0]["id"]
+    calls = mock_groq(monkeypatch,
+                      {"mode": "general"},
+                      {"document_answer": "Novatek Systems was founded in 2018 [Source 1]."})
+
+    response = ask(client, auth, "When was Novatek Systems founded?", conversation)
+
+    assert response.status_code == 200
+    assert "2018" in response.json["answer"]["content"]
+    assert response.json["answer"]["sources"] == [{
+        "index": 1, "document_id": document_id, "document_name": "sample_company_profile_novatek.pdf",
+        "page_number": 1,
+    }]
+    assert len(calls) == 2
+    passages = json.loads(calls[1]["messages"][-1]["content"])["passages"]
+    assert any("Founded 2018" in passage["text"] for passage in passages)
+
+
 def test_novatek_hybrid_retrieval_preserves_evidence_and_scope(client, auth, app, monkeypatch):
     from app.extensions import db
     from app.models import DocumentChunk
