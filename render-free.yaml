@@ -1,4 +1,4 @@
-# Free web service with an externally provisioned PostgreSQL database.
+# Free Render demo. The database expires after 30 days.
 services:
   - type: web
     name: paperwise-demo
@@ -8,7 +8,9 @@ services:
     healthCheckPath: /api/health
     envVars:
       - key: DATABASE_URL
-        sync: false
+        fromDatabase:
+          name: paperwise-demo-db
+          property: connectionString
       - key: SECRET_KEY
         generateValue: true
       - key: JWT_SECRET_KEY
@@ -23,3 +25,9 @@ services:
         value: /tmp/paperwise/chroma
       - key: EMBEDDING_CACHE_PATH
         value: /tmp/paperwise/models
+
+databases:
+  - name: paperwise-demo-db
+    region: oregon
+    plan: free
+    ipAllowList: []
