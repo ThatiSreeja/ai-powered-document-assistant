@@ -54,6 +54,9 @@ class Config:
     EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "").strip().lower()
     EMBEDDING_CACHE_PATH = Path(os.getenv("EMBEDDING_CACHE_PATH", Path.home() / ".cache" / "chroma" / "onnx_models"))
     EMBEDDING_BUNDLED_CACHE = os.getenv("EMBEDDING_BUNDLED_CACHE")
+    LOCAL_EMBEDDING_BATCH_SIZE = min(32, max(1, int(os.getenv(
+        "LOCAL_EMBEDDING_BATCH_SIZE", "8" if os.getenv("RENDER") == "true" else "32",
+    ))))
     MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "1000"))
     MAX_EXTRACTED_CHARACTERS = int(os.getenv("MAX_EXTRACTED_CHARACTERS", "2000000"))
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")

@@ -52,9 +52,12 @@ def embed(texts):
             model_dir = Path(ONNXMiniLM_L6_V2.MODEL_NAME) / "onnx" / "model.onnx"
             if bundled and not (cache / model_dir).is_file():
                 cache = Path(bundled)
-            with _model_lock:
-                model = _local_model(cache)
-            return model(texts)
+            batch_size = current_app.config["LOCAL_EMBEDDING_BATCH_SIZE"]
+            results = []
+            for start in range(0, len(texts), batch_size):
+                with _model_lock:
+                    results.extend(_local_model(cache)(texts[start:start + batch_size]))
+            return results
         except Exception:
             raise RuntimeError("The local embedding model is unavailable. Check the backend model cache and network.") from None
     if provider == "ollama":
