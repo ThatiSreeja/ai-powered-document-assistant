@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import { FileText, MessageSquare, Paperclip, Plus, RefreshCw, Send, Sparkles, Trash2, X } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import api from './services/api'
+import api, { streamMessage } from './services/api'
 import { documentStatus, isProcessing, prepareUploads, useDocumentPolling } from './services/documentJobs'
 
 const conversationsUrl = '/chat/conversations'
@@ -10,10 +10,28 @@ const attachmentUrl = id => `${conversationsUrl}/${id}/attachments`
 const messageFor = (error, fallback) => error.response?.data?.error || fallback
 const sizeLabel = bytes => bytes >= 1024 ** 2 ? `${(bytes / 1024 ** 2).toFixed(1)} MB` : `${Math.ceil(bytes / 1024)} KB`
 
+const ChatTranscript = memo(function ChatTranscript({ messages, viewPdf }) {
+  return messages.map((message, index) => <div className={`message ${message.role}`} key={message.id || `pending-message-${index}`}>
+    <span className="message-avatar">{message.role === 'assistant' ? <Sparkles size={15} /> : 'Y'}</span>
+    <div>
+      <div className="message-label">{message.role === 'user' ? 'YOU' : message.sources?.length ? 'PAPERWISE · PDF SOURCES' : 'PAPERWISE'}</div>
+      <div className="message-body">{message.role === 'assistant'
+        ? <ReactMarkdown remarkPlugins={[remarkGfm]} disallowedElements={['img']}>{message.content}</ReactMarkdown>
+        : message.content}
+      </div>
+      {message.sources?.length > 0 && <div className="source-list">{message.sources.map(source =>
+        source.page_number ? <button type="button" className="source-chip" key={source.index} onClick={() => viewPdf(source.document_id, source.page_number)}>
+          <FileText size={13} />{source.document_name} · page {source.page_number}
+        </button> : <span className="source-chip" key={source.index}><FileText size={13} />{source.document_name}</span>)}</div>}
+    </div>
+  </div>)
+})
+
 export default function Chat({ PageTitle, Empty }) {
   const [conversations, setConversations] = useState([])
   const [active, setActive] = useState(null)
   const [messages, setMessages] = useState([])
+  const [draft, setDraft] = useState('')
   const [attachments, setAttachments] = useState([])
   const [pending, setPending] = useState([])
   const [library, setLibrary] = useState(null)
@@ -27,6 +45,7 @@ export default function Chat({ PageTitle, Empty }) {
   const filePicker = useRef(null)
   const dragDepth = useRef(0)
   const messageEnd = useRef(null)
+  const sending = useRef(null)
   const hiddenDocuments = useRef(new Set())
   const locked = Boolean(operation)
   const navigating = locked || uploading || deleting > 0
@@ -52,7 +71,8 @@ export default function Chat({ PageTitle, Empty }) {
     load()
   }, [])
 
-  useEffect(() => { messageEnd.current?.scrollIntoView?.({ block: 'nearest' }) }, [messages, operation])
+  useEffect(() => { messageEnd.current?.scrollIntoView?.({ block: 'nearest' }) }, [messages, operation, draft])
+  useEffect(() => () => sending.current?.controller.abort(), [])
 
   async function open(id) {
     setOperation('loading')
@@ -72,8 +92,9 @@ export default function Chat({ PageTitle, Empty }) {
     }
   }
 
-  async function create() {
-    const { data } = await api.post(conversationsUrl, {})
+  async function create(signal) {
+    const { data } = await api.post(conversationsUrl, {}, { signal })
+    signal?.throwIfAborted()
     setActive(data.id)
     setMessages([])
     setAttachments([])
@@ -146,27 +167,54 @@ export default function Chat({ PageTitle, Empty }) {
     })()
   }
 
-  function send(event) {
+  async function send(event) {
     event.preventDefault()
     const content = question.trim()
-    if (!content || (uploading && !active)) return
-    return perform('sending', async () => {
-      const id = active || await create()
-      setQuestion('')
-      setMessages(rows => [...rows, { role: 'user', content }])
-      try {
-        const { data } = await api.post(`${conversationsUrl}/${id}/messages`, { question: content })
-        setMessages(rows => [...rows.slice(0, -1), data.user_message, data.answer])
-        api.get(conversationsUrl).then(response => setConversations(response.data)).catch(() => {})
-      } catch (err) {
-        setMessages(rows => rows.slice(0, -1))
+    if (!content || sending.current || locked || (uploading && !active)) return
+    const controller = new AbortController()
+    const pendingMessage = { role: 'user', content }
+    const request = { controller, pendingMessage }
+    sending.current = request
+    setOperation('sending')
+    setError('')
+    setQuestion('')
+    try {
+      const id = active || await create(controller.signal)
+      setMessages(rows => [...rows, pendingMessage])
+      const result = await streamMessage(`${conversationsUrl}/${id}/messages`, content, controller.signal, delta => {
+        if (sending.current === request) setDraft(value => value + delta)
+      })
+      if (sending.current !== request) return
+      setMessages(rows => [...rows.filter(row => row !== pendingMessage), result.user_message, result.answer])
+      if (result.conversation) setConversations(rows => [
+        result.conversation, ...rows.filter(row => row.id !== result.conversation.id),
+      ])
+    } catch (err) {
+      setMessages(rows => rows.filter(row => row !== pendingMessage))
+      if (sending.current === request) {
         setQuestion(value => value || content)
-        throw err
+        setError(messageFor(err, err.message || 'Could not send your question.'))
       }
-    }, 'Could not send your question.')
+    } finally {
+      if (sending.current === request) {
+        sending.current = null
+        setDraft('')
+        setOperation('')
+      }
+    }
   }
 
-  function viewPdf(documentId, pageNumber) {
+  function stop() {
+    const request = sending.current
+    if (!request) return
+    sending.current = null
+    request.controller.abort()
+    setMessages(rows => rows.filter(row => row !== request.pendingMessage))
+    setDraft('')
+    setOperation('')
+  }
+
+  const viewPdf = useCallback((documentId, pageNumber) => {
     const tab = window.open('', '_blank')
     if (!tab) { setError('Allow pop-ups to open this PDF.'); return }
     tab.opener = null
@@ -175,7 +223,7 @@ export default function Chat({ PageTitle, Empty }) {
       tab.location.replace(pageNumber ? `${url}#page=${pageNumber}` : url)
       setTimeout(() => URL.revokeObjectURL(url), 300000)
     }).catch(() => { tab.close(); setError('This PDF is unavailable.') })
-  }
+  }, [])
 
   function rename(conversation) {
     const title = window.prompt('Rename conversation', conversation.title)?.trim()
@@ -237,21 +285,10 @@ export default function Chat({ PageTitle, Empty }) {
         <div className="chat-messages">
           {operation === 'loading' && <p role="status">Loading conversation…</p>}
           {!messages.length && operation !== 'loading' && <Empty icon={Sparkles} title="Ask Paperwise anything" body="Ask a question or attach PDFs using the paperclip." />}
-          {messages.map((message, index) => <div className={`message ${message.role}`} key={message.id || `pending-message-${index}`}>
-            <span className="message-avatar">{message.role === 'assistant' ? <Sparkles size={15} /> : 'Y'}</span>
-            <div>
-              <div className="message-label">{message.role === 'user' ? 'YOU' : message.sources?.length ? 'PAPERWISE · PDF SOURCES' : 'PAPERWISE'}</div>
-              <div className="message-body">{message.role === 'assistant'
-                ? <ReactMarkdown remarkPlugins={[remarkGfm]} disallowedElements={['img']}>{message.content}</ReactMarkdown>
-                : message.content}
-              </div>
-              {message.sources?.length > 0 && <div className="source-list">{message.sources.map(source =>
-                source.page_number ? <button type="button" className="source-chip" key={source.index} onClick={() => viewPdf(source.document_id, source.page_number)}>
-                  <FileText size={13} />{source.document_name} · page {source.page_number}
-                </button> : <span className="source-chip" key={source.index}><FileText size={13} />{source.document_name}</span>)}</div>}
-            </div>
-          </div>)}
-          {operation === 'sending' && <div className="typing" role="status" aria-label="Generating response"><i /><i /><i /></div>}
+          <ChatTranscript messages={messages} viewPdf={viewPdf} />
+          {draft && <div className="message assistant"><span className="message-avatar"><Sparkles size={15} /></span>
+            <div className="message-body" style={{ whiteSpace: 'pre-wrap' }}>{draft}</div></div>}
+          {operation === 'sending' && !draft && <div className="typing" role="status" aria-label="Generating response"><i /><i /><i /></div>}
           <div ref={messageEnd} />
         </div>
         <form className={`chat-composer ${dragging ? 'chat-dragging' : ''}`} onSubmit={send}
@@ -302,7 +339,9 @@ export default function Chat({ PageTitle, Empty }) {
             <input hidden type="file" multiple accept=".pdf,application/pdf" ref={filePicker} aria-label="Choose PDF attachments" onChange={event => { upload(event.target.files); event.target.value = '' }} />
             <button type="button" className="icon-button chat-attach-button" aria-label="Attach PDFs" title="Attach PDFs" disabled={locked || uploading} onClick={() => filePicker.current?.click()}><Paperclip size={20} /></button>
             <textarea value={question} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) send(event) }} aria-label="Your question" placeholder="Ask a question…" maxLength={4000} rows="1" />
-            <button className="send-button" disabled={!question.trim() || locked || (uploading && !active)} aria-label="Send" title="Send"><Send size={16} /></button>
+            {operation === 'sending'
+              ? <button type="button" className="send-button" onClick={stop} aria-label="Stop response" title="Stop response"><X size={16} /></button>
+              : <button className="send-button" disabled={!question.trim() || locked || (uploading && !active)} aria-label="Send" title="Send"><Send size={16} /></button>}
           </div>
           <button type="button" className="chat-library-toggle" disabled={locked} onClick={() => library ? setLibrary(null) : perform('loading-library', async () => { const { data } = await api.get('/documents?type=pdf'); setLibrary(data) }, 'Could not load your PDFs.')}>
             {library ? 'Close library picker' : 'Attach from library'}

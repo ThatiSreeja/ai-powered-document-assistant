@@ -32,6 +32,10 @@ def mock_groq(monkeypatch, *replies):
         if isinstance(reply, int):
             return httpx.Response(reply, json={"error": {"message": "private upstream information"}})
         content = json.dumps(reply) if isinstance(reply, dict) else reply
+        if calls[-1].get("stream"):
+            data = json.dumps({"choices": [{"delta": {"content": content}}]})
+            return httpx.Response(200, text=f"data: {data}\n\ndata: [DONE]\n\n",
+                                  headers={"Content-Type": "text/event-stream"})
         return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": content}}]})
 
     monkeypatch.setattr(groq_chat, "Groq", lambda **options: Groq(
@@ -48,6 +52,55 @@ def create_conversation(client, auth):
 def ask(client, auth, question, conversation=None):
     path = f"{conversation}/messages" if conversation else "/api/ai/ask"
     return client.post(path, headers=auth, json={"question": question})
+
+
+def test_general_stream_delivers_text_and_persists_only_completed_turns(client, auth, monkeypatch):
+    calls = mock_groq(monkeypatch, "The answer is 42.", "Canceled.", 429)
+    conversation = create_conversation(client, auth)
+    headers = {**auth, "Accept": "application/x-ndjson"}
+
+    def send(question, *, buffered=True):
+        return client.post(conversation + "/messages", headers=headers, json={"question": question}, buffered=buffered)
+
+    events = [json.loads(line) for line in send("What is 6 times 7?").data.splitlines()]
+    assert [event["type"] for event in events] == ["start", "delta", "saving", "done"]
+    assert events[-1]["answer"]["content"] == "The answer is 42."
+    assert len(calls) == 1 and calls[0]["stream"] is True
+
+    canceled = send("Cancel this question", buffered=False)
+    assert json.loads(next(canceled.response))["type"] == "start"
+    assert json.loads(next(canceled.response))["type"] == "delta"
+    canceled.close()
+    limited = [json.loads(line) for line in send("Try again").data.splitlines()]
+    assert limited[-1]["status"] == 429
+    assert "private upstream information" not in limited[-1]["error"]
+    assert len(client.get(conversation, headers=auth).json["messages"]) == 2
+
+
+def test_stream_routes_with_ready_pdf_without_using_it_for_general_chat(client, auth, monkeypatch):
+    conversation = create_conversation(client, auth)
+    uploaded = client.post(conversation + "/attachments", headers=auth, data={
+        "files": (pdf("Orchard launches in June."), "orchard.pdf"),
+    })
+    document_id = uploaded.json[0]["id"]
+    calls = mock_groq(monkeypatch, {"mode": "general"}, "A tuple is immutable.",
+                      {"mode": "document", "document_ids": [document_id]},
+                      {"document_answer": "Orchard launches in June. [Source 1]"})
+    headers = {**auth, "Accept": "application/x-ndjson"}
+
+    def send(question):
+        response = client.post(conversation + "/messages", headers=headers, json={"question": question})
+        return [json.loads(line) for line in response.data.splitlines()]
+
+    with monkeypatch.context() as general:
+        general.setattr(vectors, "embed", lambda _: pytest.fail("General chat ran semantic search"))
+        events = send("What is a tuple in Python?")
+    assert events[-1]["answer"]["sources"] == []
+    assert calls[1]["stream"] is True
+    events = send("When does Orchard launch according to orchard.pdf?")
+    assert events[-1]["answer"]["sources"] == [{
+        "index": 1, "document_id": document_id, "document_name": "orchard.pdf", "page_number": 1,
+    }]
 
 
 def pdf(text, page_number=1):
@@ -160,7 +213,7 @@ def test_attachments_are_reused_and_scoped_to_conversation(client, auth, monkeyp
     assert len(client.get(first, headers=auth).json["attachments"]) == 1
     assert not client.get(second, headers=auth).json["attachments"]
 
-    calls = mock_groq(monkeypatch, {"mode": "general", "query": "Kestrel database"},
+    calls = mock_groq(monkeypatch, {"mode": "automatic", "query": "Kestrel database"},
                       {"document_answer": "Kestrel uses PostgreSQL [Source 1]."},
                       {"mode": "document", "document_ids": [document_id]},
                       {"mode": "document", "overview": True},

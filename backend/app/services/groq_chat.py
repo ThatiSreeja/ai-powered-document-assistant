@@ -1,5 +1,8 @@
+from contextlib import contextmanager
+
 from flask import current_app
 from groq import APIConnectionError, APIError, APITimeoutError, AuthenticationError, Groq, RateLimitError
+from httpx import TimeoutException, TransportError
 
 
 class GroqError(RuntimeError):
@@ -8,7 +11,8 @@ class GroqError(RuntimeError):
         self.status = status
 
 
-def complete(system, messages, *, structured=False, max_tokens=3000):
+@contextmanager
+def _completion(system, messages, *, structured=False, max_tokens=3000, streaming=False):
     config = current_app.config
     key = config.get("GROQ_API_KEY")
     if not key:
@@ -24,19 +28,33 @@ def complete(system, messages, *, structured=False, max_tokens=3000):
                 messages=[{"role": "system", "content": system}, *messages],
                 temperature=0,
                 max_completion_tokens=max_tokens,
+                **({"stream": True} if streaming else {}),
                 **options,
             )
+            yield response
     except RateLimitError:
         raise GroqError("Groq is rate limited. Wait a moment and retry.", 429) from None
-    except APITimeoutError:
+    except (APITimeoutError, TimeoutException):
         raise GroqError("Groq took too long to respond. Please retry.", 504) from None
     except AuthenticationError:
         raise GroqError("Groq rejected the backend API key. Check GROQ_API_KEY and restart the backend.", 503) from None
-    except APIConnectionError:
+    except (APIConnectionError, TransportError):
         raise GroqError("Could not connect to Groq. Please retry.", 503) from None
     except APIError:
         raise GroqError("Groq is unavailable. Please retry or check the backend configuration.", 503) from None
-    answer = response.choices[0].message.content if response.choices else None
-    if not answer or not answer.strip():
-        raise GroqError("Groq returned an empty response. Please retry.", 502)
-    return answer.strip()
+
+
+def complete(system, messages, *, structured=False, max_tokens=3000):
+    with _completion(system, messages, structured=structured, max_tokens=max_tokens) as response:
+        answer = response.choices[0].message.content if response.choices else None
+        if not answer or not answer.strip():
+            raise GroqError("Groq returned an empty response. Please retry.", 502)
+        return answer.strip()
+
+
+def stream(system, messages):
+    with _completion(system, messages, streaming=True) as response:
+        with response:
+            for chunk in response:
+                if chunk.choices and (content := chunk.choices[0].delta.content):
+                    yield content

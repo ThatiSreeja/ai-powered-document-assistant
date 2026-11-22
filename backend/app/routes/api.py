@@ -1,16 +1,18 @@
+import json
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from time import perf_counter
-from flask import Blueprint, current_app, jsonify, request, send_file
+from flask import Blueprint, Response, current_app, jsonify, request, send_file, stream_with_context
 from flask_jwt_extended import (
     create_access_token, get_csrf_token, get_jwt, get_jwt_identity, jwt_required,
     set_access_cookies, unset_jwt_cookies,
 )
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from app.extensions import db
 from app.models import Conversation, Document, Message, RevokedToken, User, utcnow
 from app.services.documents import extract_pages
+from app.services.chat import answer_stream
 from app.services.ingestion import ingest, process_document
 from app.services.document_jobs import enqueue, file_source, PROCESSING
 from app.services.rag import answer_question, summarize
@@ -304,7 +306,9 @@ def send_message(conversation_id):
     conv = Conversation.query.filter_by(id=conversation_id, user_id=uid).first()
     if not conv:
         return error("Conversation not found.", 404)
-    question = ((request.get_json(silent=True) or {}).get("question") or "").strip()
+    payload = request.get_json(silent=True)
+    value = payload.get("question") if isinstance(payload, dict) else None
+    question = value.strip() if isinstance(value, str) else ""
     if not question or len(question) > 4000:
         return error("Question must contain 1 to 4000 characters.")
     recent = Message.query.filter_by(conversation_id=conv.id).order_by(Message.id.desc()).limit(12).all()
@@ -320,24 +324,70 @@ def send_message(conversation_id):
         if remaining <= 0:
             break
     history.reverse()
+    db.session.rollback()
     started = perf_counter()
+    if request.accept_mimetypes.best == "application/x-ndjson":
+        return Response(stream_with_context(stream_message(uid, conversation_id, question, history, started)),
+                        mimetype="application/x-ndjson",
+                        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
     try:
-        answer, sources = answer_question(uid, question, history, conversation_id=conv.id)
+        answer, sources = answer_question(uid, question, history, conversation_id=conversation_id)
     except GroqError:
         raise
     except RuntimeError as exc:
         db.session.rollback()
         return error(str(exc), 503)
+    result = save_turn(uid, conversation_id, question, answer, sources, started)
+    return jsonify(result) if result else error("Conversation not found.", 404)
+
+
+def stream_message(uid, conversation_id, question, history, started):
+    def event(kind, **fields):
+        return json.dumps({"type": kind, **fields}) + "\n"
+
+    yield event("start")
+    try:
+        if current_app.config["AI_PROVIDER"] == "groq":
+            with_stream = answer_stream(uid, question, history, conversation_id=conversation_id)
+            try:
+                while True:
+                    yield event("delta", content=next(with_stream))
+            except StopIteration as done:
+                answer, sources = done.value
+            finally:
+                with_stream.close()
+        else:
+            answer, sources = answer_question(uid, question, history, conversation_id=conversation_id)
+        yield event("saving")
+        result = save_turn(uid, conversation_id, question, answer, sources, started)
+        yield event("done", **result) if result else event("error", error="Conversation not found.", status=404)
+    except GroqError as exc:
+        yield event("error", error=str(exc), status=exc.status)
+    except SQLAlchemyError:
+        current_app.logger.exception("Chat stream database operation failed")
+        yield event("error", error="Database unavailable. Please retry.", status=503)
+    except RuntimeError as exc:
+        yield event("error", error=str(exc), status=503)
+    finally:
+        db.session.rollback()
+
+
+def save_turn(uid, conversation_id, question, answer, sources, started):
+    conv = Conversation.query.filter_by(id=conversation_id, user_id=uid).with_for_update().first()
+    if conv is None:
+        return None
     user_message = Message(conversation_id=conv.id, role="user", content=question)
     assistant = Message(conversation_id=conv.id, role="assistant", content=answer, sources=sources)
     if conv.title == "New conversation":
         conv.title = question[:80]
     conv.updated_at = utcnow()
     db.session.add_all([user_message, assistant])
+    db.session.flush()
+    result = {"user_message": user_message.to_dict(), "answer": assistant.to_dict(), "conversation": conv.to_dict()}
     db.session.commit()
     if current_app.config["DOCUMENT_JOBS"]:
         current_app.logger.info("Chat response duration=%.3fs citations=%s", perf_counter() - started, len(sources))
-    return jsonify({"user_message": user_message.to_dict(), "answer": assistant.to_dict()})
+    return result
 
 
 @api.post("/chat/conversations/<int:conversation_id>/attachments")

@@ -203,8 +203,13 @@ def _stored_hits(query, user_id, document_ids, limit, max_distance):
         return []
     keys = [(document_id, position) for _, document_id, position in selected]
     passages = {
-        (chunk.document_id, chunk.position): _stored_passage(chunk, name)
-        for chunk, name in db.session.execute(select(DocumentChunk, Document.original_name).join(Document).where(
+        (document_id, position): {"text": content, "metadata": {
+            "document_id": document_id, "document_name": name, "page_number": page_number,
+        }}
+        for document_id, position, content, page_number, name in db.session.execute(select(
+            DocumentChunk.document_id, DocumentChunk.position, DocumentChunk.content,
+            DocumentChunk.page_number, Document.original_name,
+        ).join(Document).where(
             Document.user_id == user_id, Document.status == "ready",
             tuple_(DocumentChunk.document_id, DocumentChunk.position).in_(keys),
         ))
